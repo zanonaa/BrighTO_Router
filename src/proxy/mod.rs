@@ -1641,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_xai_request_is_bearer_without_extra_headers() {
+    fn oauth_xai_request_carries_client_version_header() {
         let client = reqwest::Client::new();
         let req = build_reqwest_request(
             &client,
@@ -1657,6 +1657,14 @@ mod tests {
         assert_eq!(
             req.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
             "Bearer xai-token"
+        );
+        // cli-chat-proxy.grok.com parses the client version from exactly this header; without it
+        // every request dies with 426 "Your Grok CLI version (none) is outdated".
+        assert_eq!(
+            req.headers()
+                .get(crate::provider_auth::XAI_CLIENT_VERSION_HEADER)
+                .unwrap(),
+            crate::provider_auth::XAI_GROK_CLIENT_VERSION
         );
         assert!(
             req.headers()
