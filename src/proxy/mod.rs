@@ -26,6 +26,26 @@ pub fn chunk_may_have_usage(chunk: &[u8]) -> bool {
     memchr::memmem::find(chunk, b"\"usage\"").is_some()
 }
 
+/// Whether the proxy should splice `"stream_options":{"include_usage":true}` into a streaming
+/// request body. OpenAI-compatible **chat** streams benefit from the parameter (usage arrives in
+/// the final SSE chunk instead of never). The Responses APIs do not: OpenAI `/v1/responses` and
+/// the ChatGPT Codex backend both reject `stream_options` with `unknown_parameter`, so splicing
+/// there turns every streaming call into an upstream 400.
+pub fn wants_include_usage_splice(
+    format: BackendFormat,
+    stream_request: bool,
+    stream_options_present: bool,
+    protocol: ProviderProtocol,
+) -> bool {
+    format == BackendFormat::OpenAi
+        && stream_request
+        && !stream_options_present
+        && !matches!(
+            protocol,
+            ProviderProtocol::OpenAiResponses | ProviderProtocol::CodexResponses
+        )
+}
+
 /// Byte-splice: chèn ,"stream_options":{"include_usage":true} trước } cuối cùng.
 /// Chỉ gọi khi stream=true VÀ body chưa chứa "stream_options". Đã verify trên llama-server thật.
 pub fn splice_include_usage(body: &[u8]) -> Option<Vec<u8>> {
@@ -1139,11 +1159,12 @@ pub async fn proxy_forward(
                 } else {
                     None
                 };
-                if backend.format == BackendFormat::OpenAi
-                    && stream_request
-                    && !ctx.stream_options_present
-                    && ctx.protocol != ProviderProtocol::OpenAiResponses
-                {
+                if wants_include_usage_splice(
+                    backend.format,
+                    stream_request,
+                    ctx.stream_options_present,
+                    ctx.protocol,
+                ) {
                     let bytes = if let Some(chunks) = model_rewrite_chunks.take() {
                         materialize_chunks(chunks).map(Bytes::from)
                     } else {
@@ -1162,10 +1183,12 @@ pub async fn proxy_forward(
                 }
             }
             ProxyRequestBody::Streaming { .. }
-                if backend.format == BackendFormat::OpenAi
-                    && stream_request
-                    && !ctx.stream_options_present
-                    && ctx.protocol != ProviderProtocol::OpenAiResponses =>
+                if wants_include_usage_splice(
+                    backend.format,
+                    stream_request,
+                    ctx.stream_options_present,
+                    ctx.protocol,
+                ) =>
             {
                 request_total_for(&ctx, &backend.name, 500);
                 return tag_router_headers(
@@ -1676,6 +1699,52 @@ mod tests {
         assert!(spliced.windows(needle.len()).any(|w| w == needle));
         assert!(splice_include_usage(b"").is_none());
         assert!(splice_include_usage(b"no brace").is_none());
+    }
+
+    #[test]
+    fn include_usage_splice_skips_both_responses_protocols() {
+        // OpenAI-compatible chat streaming: splice, so usage lands in the final SSE chunk.
+        assert!(wants_include_usage_splice(
+            BackendFormat::OpenAi,
+            true,
+            false,
+            ProviderProtocol::OpenAiChat
+        ));
+        // Not streaming, or the client already sent stream_options: nothing to add.
+        assert!(!wants_include_usage_splice(
+            BackendFormat::OpenAi,
+            false,
+            false,
+            ProviderProtocol::OpenAiChat
+        ));
+        assert!(!wants_include_usage_splice(
+            BackendFormat::OpenAi,
+            true,
+            true,
+            ProviderProtocol::OpenAiChat
+        ));
+        // Responses APIs reject stream_options with unknown_parameter — never splice there.
+        // CodexResponses is the regression: the ChatGPT Codex backend 400s every streaming
+        // request when the parameter leaks in.
+        assert!(!wants_include_usage_splice(
+            BackendFormat::OpenAi,
+            true,
+            false,
+            ProviderProtocol::OpenAiResponses
+        ));
+        assert!(!wants_include_usage_splice(
+            BackendFormat::OpenAi,
+            true,
+            false,
+            ProviderProtocol::CodexResponses
+        ));
+        // Non-OpenAI dialects (e.g. Anthropic) never take this parameter.
+        assert!(!wants_include_usage_splice(
+            BackendFormat::Anthropic,
+            true,
+            false,
+            ProviderProtocol::OpenAiChat
+        ));
     }
 
     #[test]
