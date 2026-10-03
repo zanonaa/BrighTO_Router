@@ -26,6 +26,10 @@ pub enum HeaderMode {
     Bearer,
     /// `x-api-key: <credential>`.
     XApiKey,
+    /// OpenCode Zen free tier: no operator credential. The literal public bearer plus the
+    /// client-identity headers (including fresh per-request canonical ids) are applied by
+    /// `apply_headers` from the mode alone.
+    OpenCodeFree,
     /// No provider credential header at all (local llama.cpp / vLLM / Ollama).
     None,
 }
@@ -54,6 +58,16 @@ pub const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.0.0 (external, cli)";
 /// `chatgpt.com/backend-api/*`; the value is read from the `id_token` JWT claim
 /// `chatgpt_account_id` (or `access_token.organizations[0].id`) at exchange time.
 pub const CODEX_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+
+/// `auth_mode` for the OpenCode Zen free tier (`https://opencode.ai/zen/v1`). No credential:
+/// the upstream gates on a fixed public bearer plus client-identity headers instead.
+pub const OPENCODE_FREE_AUTH_MODE: &str = "opencode_free";
+
+/// OpenCode Zen free-tier client version advertised in `User-Agent`. The upstream rejects a
+/// request whose UA carries no opencode version >= 1.17.0. Pinned rather than discovered:
+/// BrighTO-Router is not the opencode client. When the floor moves, the 4xx body says so —
+/// bump this constant.
+pub const OPENCODE_FREE_USER_AGENT: &str = "opencode/1.18.31";
 
 /// Header `cli-chat-proxy.grok.com` reads the client version from. The gate sits behind
 /// authentication, so it cannot be probed unauthenticated, and it reads exactly this header:
@@ -97,12 +111,26 @@ pub const AUTH_MODES: &[&str] = &[
     OAUTH_AUTH_MODE_ANTHROPIC,
     OAUTH_AUTH_MODE_CHATGPT,
     OAUTH_AUTH_MODE_XAI,
+    OPENCODE_FREE_AUTH_MODE,
 ];
 
 /// True when `auth_mode` selects an OAuth credential.
 pub fn is_oauth_mode(auth_mode: &str) -> bool {
     let m = auth_mode.trim().to_ascii_lowercase();
     m == OAUTH_AUTH_MODE_ANTHROPIC || m == OAUTH_AUTH_MODE_CHATGPT || m == OAUTH_AUTH_MODE_XAI
+}
+
+/// True when `auth_mode` selects the OpenCode Zen free tier.
+pub fn is_opencode_free_mode(auth_mode: &str) -> bool {
+    auth_mode.trim().to_ascii_lowercase() == OPENCODE_FREE_AUTH_MODE
+}
+
+/// True when a route with this `auth_mode` may load and serve traffic with **no** provider key:
+/// `none` (local llama.cpp / vLLM) and the OpenCode free tier, whose `public` bearer and
+/// client-identity headers come from the mode itself rather than from a credential.
+pub fn auth_mode_needs_no_key(auth_mode: &str) -> bool {
+    let m = auth_mode.trim().to_ascii_lowercase();
+    m == "none" || m == OPENCODE_FREE_AUTH_MODE
 }
 
 /// Normalize a client-supplied `auth_mode`, or `None` when the value is not one BrighTO knows.
@@ -176,6 +204,7 @@ pub fn resolve<'a>(
         };
     match mode.as_str() {
         "none" => dialect(HeaderMode::None, &[], None),
+        m if is_opencode_free_mode(m) => dialect(HeaderMode::OpenCodeFree, &[], None),
         "anthropic" => dialect(
             if backend_anthropic {
                 HeaderMode::XApiKey
@@ -216,19 +245,54 @@ pub fn resolve<'a>(
 /// client's `Authorization` cannot survive alongside the provider's — and *appends* the
 /// `anthropic-beta` values, so a client that explicitly opted out of a beta stays opted out.
 ///
-/// An empty `credential` writes nothing at all: a route whose credential did not resolve is
-/// better rejected by the provider with a clear 401 than sent as a half-formed request.
+/// An empty `credential` writes nothing at all for the secret-carrying modes: a route whose
+/// credential did not resolve is better rejected by the provider with a clear 401 than sent as a
+/// half-formed request. The OpenCode free mode is the exception — it has no secret to fail on,
+/// so its fixed `Bearer public` and client-identity headers are always applied.
 pub fn apply_headers(
     headers: &mut HeaderMap,
     plan: &AuthPlan<'_>,
     credential: &str,
 ) -> Result<(), String> {
-    if credential.is_empty() {
-        return Ok(());
-    }
     match plan.mode {
         HeaderMode::None => return Ok(()),
+        HeaderMode::OpenCodeFree => {
+            // The free tier authenticates on client identity, not on a secret: fixed public
+            // bearer, pinned opencode User-Agent (the gate rejects other UAs), and fresh
+            // canonical session/request ids per request — a reused id is rejected with 403.
+            headers.insert(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer public"),
+            );
+            headers.insert(
+                HeaderName::from_static("user-agent"),
+                HeaderValue::from_static(OPENCODE_FREE_USER_AGENT),
+            );
+            headers.insert(
+                HeaderName::from_static("x-opencode-client"),
+                HeaderValue::from_static("desktop"),
+            );
+            headers.insert(
+                HeaderName::from_static("x-opencode-project"),
+                HeaderValue::from_static("global"),
+            );
+            let session = crate::opencode_free::new_session_id();
+            let request = crate::opencode_free::new_request_id();
+            headers.insert(
+                HeaderName::from_static("x-opencode-session"),
+                HeaderValue::from_str(&session)
+                    .map_err(|_| "invalid opencode session id".to_string())?,
+            );
+            headers.insert(
+                HeaderName::from_static("x-opencode-request"),
+                HeaderValue::from_str(&request)
+                    .map_err(|_| "invalid opencode request id".to_string())?,
+            );
+        }
         HeaderMode::Bearer => {
+            if credential.is_empty() {
+                return Ok(());
+            }
             headers.insert(
                 HeaderName::from_static("authorization"),
                 HeaderValue::from_str(&format!("Bearer {credential}"))
@@ -236,6 +300,9 @@ pub fn apply_headers(
             );
         }
         HeaderMode::XApiKey => {
+            if credential.is_empty() {
+                return Ok(());
+            }
             headers.insert(
                 HeaderName::from_static("x-api-key"),
                 HeaderValue::from_str(credential)
@@ -417,8 +484,68 @@ mod tests {
         assert_eq!(parse_auth_mode("ANTHROPIC_OAUTH"), Some("anthropic_oauth"));
         assert_eq!(parse_auth_mode("chatgpt_oauth"), Some("chatgpt_oauth"));
         assert_eq!(parse_auth_mode("xai_oauth"), Some("xai_oauth"));
+        assert_eq!(parse_auth_mode("  OPENCODE_FREE "), Some("opencode_free"));
         assert_eq!(parse_auth_mode("basic"), None);
         assert_eq!(parse_auth_mode(""), None);
+    }
+
+    #[test]
+    fn opencode_free_mode_detection_and_key_rules() {
+        assert!(is_opencode_free_mode("opencode_free"));
+        assert!(is_opencode_free_mode(" OpenCode_Free "));
+        assert!(!is_opencode_free_mode("opencode-free"));
+        assert!(!is_opencode_free_mode("none"));
+        // A free-tier route loads and serves with no provider key, exactly like `none`.
+        assert!(auth_mode_needs_no_key("none"));
+        assert!(auth_mode_needs_no_key("opencode_free"));
+        assert!(!auth_mode_needs_no_key("bearer"));
+        assert!(!auth_mode_needs_no_key("anthropic_oauth"));
+    }
+
+    #[test]
+    fn opencode_free_resolves_to_its_own_header_mode() {
+        let p = resolve(OPENCODE_FREE_AUTH_MODE, false, Some("acct"));
+        assert_eq!(p.mode, HeaderMode::OpenCodeFree);
+        assert!(p.extra_headers.is_empty());
+        assert!(
+            p.account_id.is_none(),
+            "the free tier has no account credential to attribute"
+        );
+    }
+
+    #[test]
+    fn opencode_free_headers_apply_with_an_empty_credential() {
+        let mut h = HeaderMap::new();
+        apply_headers(&mut h, &resolve(OPENCODE_FREE_AUTH_MODE, false, None), "").unwrap();
+        assert_eq!(h.get("authorization").unwrap(), "Bearer public");
+        assert_eq!(h.get("user-agent").unwrap(), OPENCODE_FREE_USER_AGENT);
+        assert_eq!(h.get("x-opencode-client").unwrap(), "desktop");
+        assert_eq!(h.get("x-opencode-project").unwrap(), "global");
+        let session = h.get("x-opencode-session").unwrap().to_str().unwrap();
+        let request = h.get("x-opencode-request").unwrap().to_str().unwrap();
+        assert!(crate::opencode_free::is_canonical_id("ses_", session));
+        assert!(crate::opencode_free::is_canonical_id("msg_", request));
+    }
+
+    #[test]
+    fn opencode_free_replaces_a_client_user_agent_and_ids_are_fresh() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", HeaderValue::from_static("curl/8.0"));
+        apply_headers(&mut h, &resolve(OPENCODE_FREE_AUTH_MODE, false, None), "").unwrap();
+        // insert (not append): a client UA that parses as "no opencode version" must not ride
+        // alongside the pinned one.
+        assert_eq!(h.get("user-agent").unwrap(), OPENCODE_FREE_USER_AGENT);
+
+        let first = h
+            .get("x-opencode-session")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut h2 = HeaderMap::new();
+        apply_headers(&mut h2, &resolve(OPENCODE_FREE_AUTH_MODE, false, None), "").unwrap();
+        let second = h2.get("x-opencode-session").unwrap().to_str().unwrap();
+        assert_ne!(first, second, "session ids must be fresh per request");
     }
 
     #[test]
