@@ -73,6 +73,22 @@ Honest read: Model Groups add routing choice, per-endpoint model rewrite, Postgr
 | Vibe-coding and agent traffic with huge contexts | Large JSON bodies stay pass-through; the router avoids storing prompt content and keeps memory behavior visible. |
 | Multiple local and cloud backends | Model Groups can balance one client-facing model name across compatible endpoints while clients keep the same request. |
 
+## Published Docker images
+
+The fork publishes `ghcr.io/zanonaa/brighto_router:latest` from `main`, with native
+**Linux amd64 and arm64** builds in one multi-architecture manifest. Docker selects
+the architecture automatically:
+
+```bash
+docker pull ghcr.io/zanonaa/brighto_router:latest
+```
+
+Tags named `v*` also publish a matching image tag; every build has an immutable
+`sha-<full commit SHA>` tag. The image retains the existing Dockerfile's non-root
+user, healthcheck, embedded Portal, and `/var/lib/brighto-router` data volume.
+PostgreSQL configuration and migrations are still required; pulling an image does
+not initialize a database. Release tarballs remain available separately.
+
 ## Quick start
 
 Prerequisites: Linux, Docker, Docker Compose plugin, Git, and `curl`.
