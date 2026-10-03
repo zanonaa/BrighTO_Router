@@ -144,6 +144,9 @@ impl DbConfigLoader {
             let backend_format = match format.as_str() {
                 "openai" => BackendFormat::OpenAi,
                 "anthropic" => BackendFormat::Anthropic,
+                // Marker dialect, not a third wire format: the free tier speaks OpenAI-compatible
+                // JSON; the marker only tells admin probes to send the free-tier identity headers.
+                "opencode_free" => BackendFormat::OpenAi,
                 other => return Err(anyhow!("unknown backend format '{other}' for backend {id}")),
             };
             let api_key = resolve_backend_key(&api_key_ref);
