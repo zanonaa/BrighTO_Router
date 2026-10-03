@@ -625,6 +625,9 @@ pub struct ProxyContext {
     pub protocol: ProviderProtocol,
     /// True only when proxy must rewrite top-level JSON model after endpoint selection.
     pub rewrite_model_in_proxy: bool,
+    /// OpenCode Zen free tier: the request adapter pinned `stream:true`, so upstream errors are
+    /// re-mapped and a non-stream client call gets the forced SSE folded into one JSON.
+    pub opencode_free: bool,
     pub reservation: Option<BudgetReservation>,
     pub concurrency: Option<ConcurrencyGuard>,
     pub start: Instant,
@@ -1052,6 +1055,158 @@ fn tag_router_headers(
     resp
 }
 
+/// Bounded buffer for one whole small upstream response (error bodies and the OpenCode free
+/// SSE lane). Uses the streaming reader — never `.bytes().await`, which the hot-path guard
+/// reserves for the Content-Length fast path in `forward_backend_response`.
+async fn read_bounded_response(
+    response: reqwest::Response,
+    limit: u64,
+) -> Result<(Bytes, reqwest::header::HeaderMap), String> {
+    let headers = response.headers().clone();
+    let mut stream = response.bytes_stream();
+    let mut buf = Vec::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
+        match next {
+            Ok(Some(Ok(bytes))) => {
+                if (buf.len() as u64).saturating_add(bytes.len() as u64) > limit {
+                    return Err("response body exceeded the buffering limit".to_string());
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            Ok(Some(Err(e))) => return Err(e.to_string()),
+            Ok(None) => break,
+            Err(_) => return Err("idle timeout".to_string()),
+        }
+    }
+    Ok((Bytes::from(buf), headers))
+}
+
+/// Response body cap for the OpenCode free lane: free-tier completions and error bodies are
+/// small, and folding a stream larger than this would only hide a runaway upstream.
+const OPENCODE_FREE_BODY_LIMIT: u64 = 1024 * 1024;
+
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"))
+}
+
+fn json_content_type_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers
+}
+
+/// OpenCode free-tier response adaptation. Consumes the upstream response and always builds the
+/// final client response:
+///
+/// * a mapped error becomes a clean JSON error (429 per-IP limit / 404 model not supported /
+///   503 model unavailable); an unrecognized error body is forwarded unchanged;
+/// * a successful SSE stream answering a client `stream:false` is folded into one
+///   `chat.completion` (see `opencode_free::aggregate_sse_to_completion`) — the client asked
+///   for JSON, so it must never see the forced SSE frames.
+#[allow(clippy::too_many_arguments)]
+async fn opencode_free_lane(
+    state: &Arc<AppState>,
+    ctx: &ProxyContext,
+    response: reqwest::Response,
+    status: StatusCode,
+    backend_id: i64,
+    backend_name: &str,
+    pre_forward_ms: u64,
+    ttfb_ms: u64,
+    reservation: Option<BudgetReservation>,
+    concurrency: Option<ConcurrencyGuard>,
+    lease: BackendLease,
+) -> Response<Body> {
+    let upstream_status = status.as_u16();
+    let mut reporter = CompletionReporter::new(
+        state.clone(),
+        ctx,
+        backend_id,
+        backend_name.to_string(),
+        pre_forward_ms,
+        ttfb_ms,
+        reservation,
+        concurrency,
+        lease,
+    );
+    match read_bounded_response(response, OPENCODE_FREE_BODY_LIMIT).await {
+        Ok((body, upstream_headers)) => {
+            if !status.is_success() {
+                let text = String::from_utf8_lossy(&body);
+                if let Some((mapped_status, message)) =
+                    crate::opencode_free::map_upstream_error(upstream_status, &text)
+                {
+                    reporter.finish(mapped_status, 0, 0, true, false, None);
+                    let body = crate::opencode_free::error_body(mapped_status, message);
+                    return build_response(
+                        StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        json_content_type_headers(),
+                        Body::from(body.to_string()),
+                    );
+                }
+                // Not one of the known free-tier gates: forward the upstream error untouched.
+                reporter.finish(upstream_status, 0, 0, true, false, None);
+                return build_response(status, upstream_headers, Body::from(body));
+            }
+            match crate::opencode_free::aggregate_sse_to_completion(&body, &ctx.model_name) {
+                Some(completion) => {
+                    let bytes = completion.to_string();
+                    let acc = parse_usage_from_body(bytes.as_bytes(), BackendFormat::OpenAi);
+                    reporter.finish(
+                        upstream_status,
+                        acc.input_tokens,
+                        acc.output_tokens,
+                        !acc.seen_usage,
+                        false,
+                        None,
+                    );
+                    build_response(status, json_content_type_headers(), Body::from(bytes))
+                }
+                None => {
+                    reporter.finish(
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        0,
+                        0,
+                        true,
+                        false,
+                        Some("opencode free sse aggregation failed".to_string()),
+                    );
+                    build_response(
+                        StatusCode::BAD_GATEWAY,
+                        reqwest::header::HeaderMap::new(),
+                        Body::from(
+                            "opencode free tier: could not fold the upstream SSE into a completion",
+                        ),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            reporter.finish(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                0,
+                0,
+                true,
+                false,
+                Some(e.clone()),
+            );
+            build_response(
+                StatusCode::BAD_GATEWAY,
+                reqwest::header::HeaderMap::new(),
+                Body::from(format!("opencode free tier response read failed: {e}")),
+            )
+        }
+    }
+}
+
 /// Điểm vào proxy: chọn backend (lease), retry trước byte đầu, forward response (stream thật).
 pub async fn proxy_forward(
     state: Arc<AppState>,
@@ -1159,12 +1314,16 @@ pub async fn proxy_forward(
                 } else {
                     None
                 };
-                if wants_include_usage_splice(
-                    backend.format,
-                    stream_request,
-                    ctx.stream_options_present,
-                    ctx.protocol,
-                ) {
+                // The OpenCode free lane keeps the validated wire shape byte-for-byte: its
+                // upstream was probed without stream_options, so no include_usage splice there.
+                if !ctx.opencode_free
+                    && wants_include_usage_splice(
+                        backend.format,
+                        stream_request,
+                        ctx.stream_options_present,
+                        ctx.protocol,
+                    )
+                {
                     let bytes = if let Some(chunks) = model_rewrite_chunks.take() {
                         materialize_chunks(chunks).map(Bytes::from)
                     } else {
@@ -1183,12 +1342,13 @@ pub async fn proxy_forward(
                 }
             }
             ProxyRequestBody::Streaming { .. }
-                if wants_include_usage_splice(
-                    backend.format,
-                    stream_request,
-                    ctx.stream_options_present,
-                    ctx.protocol,
-                ) =>
+                if !ctx.opencode_free
+                    && wants_include_usage_splice(
+                        backend.format,
+                        stream_request,
+                        ctx.stream_options_present,
+                        ctx.protocol,
+                    ) =>
             {
                 request_total_for(&ctx, &backend.name, 500);
                 return tag_router_headers(
@@ -1311,6 +1471,34 @@ pub async fn proxy_forward(
                     state.backends.note_result(backend_id, true);
                 }
                 let ttfb_ms = start.elapsed().as_millis() as u64;
+                // OpenCode free lane: the upstream's identity gates (429/403 per-IP limit,
+                // 401/400 model gates) become client-actionable statuses, and a successful SSE
+                // body answering a non-stream client call is folded into one chat.completion.
+                let sse_body = is_event_stream(&resp);
+                let lane_applies = matches!(status, 400 | 401 | 403 | 429)
+                    || (status < 400 && !stream_request && sse_body);
+                if ctx.opencode_free && lane_applies {
+                    let adapted = opencode_free_lane(
+                        &state,
+                        &ctx,
+                        resp,
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        backend_id,
+                        &backend.name,
+                        pre_forward_ms,
+                        ttfb_ms,
+                        reservation,
+                        concurrency,
+                        l,
+                    )
+                    .await;
+                    return tag_router_headers(
+                        adapted,
+                        &ctx.request_id,
+                        Some(&backend.name),
+                        pre_forward_ms,
+                    );
+                }
                 let reporter = CompletionReporter::new(
                     state.clone(),
                     &ctx,
@@ -1670,6 +1858,62 @@ mod tests {
             req.headers()
                 .get(crate::provider_auth::CODEX_ACCOUNT_HEADER)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn opencode_free_request_carries_identity_headers_with_no_credential() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        // A client UA must not ride alongside the pinned one: the gate rejects version-less UAs.
+        headers.insert("user-agent", HeaderValue::from_static("curl/8.9.1"));
+        let plan = resolve_auth_plan(crate::provider_auth::OPENCODE_FREE_AUTH_MODE, false, None);
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/chat/completions",
+            &headers,
+            reqwest::Body::from(Bytes::from("{}")),
+            &plan,
+            "",
+            "rid-opencode",
+        )
+        .unwrap();
+        let h = req.headers();
+        assert_eq!(
+            h.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer public"
+        );
+        assert_eq!(
+            h.get(reqwest::header::USER_AGENT).unwrap(),
+            crate::provider_auth::OPENCODE_FREE_USER_AGENT
+        );
+        assert_eq!(h.get("x-opencode-client").unwrap(), "desktop");
+        assert_eq!(h.get("x-opencode-project").unwrap(), "global");
+        let session = h.get("x-opencode-session").unwrap().to_str().unwrap();
+        let request = h.get("x-opencode-request").unwrap().to_str().unwrap();
+        assert!(crate::opencode_free::is_canonical_id("ses_", session));
+        assert!(crate::opencode_free::is_canonical_id("msg_", request));
+
+        // A second request must carry fresh ids — the upstream 403s reused identities.
+        let req2 = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/chat/completions",
+            &HeaderMap::new(),
+            reqwest::Body::from(Bytes::from("{}")),
+            &plan,
+            "",
+            "rid-opencode-2",
+        )
+        .unwrap();
+        assert_ne!(
+            req2.headers().get("x-opencode-session").unwrap(),
+            req.headers().get("x-opencode-session").unwrap()
+        );
+        assert_ne!(
+            req2.headers().get("x-opencode-request").unwrap(),
+            req.headers().get("x-opencode-request").unwrap()
         );
     }
 
