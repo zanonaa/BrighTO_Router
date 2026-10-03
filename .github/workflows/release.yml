@@ -112,7 +112,9 @@ jobs:
           ls -lh
           sha256sum *.tar.gz > SHA256SUMS
           # First run creates the release; a re-run of this job uploads over it.
-          gh release create "$GITHUB_REF_NAME" . \
-            --title "BrighTO-Router $GITHUB_REF_NAME" \
-            --generate-notes \
-            || gh release upload "$GITHUB_REF_NAME" . --clobber
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "BrighTO-Router $GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            ./*.tar.gz SHA256SUMS --clobber
