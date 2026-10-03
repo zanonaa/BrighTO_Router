@@ -60,6 +60,7 @@ Honest read: Model Groups add routing choice, per-endpoint model rewrite, Postgr
 | ASR / transcription | `/v1/audio/transcriptions` multipart proxy path. |
 | System One / decisions | `/v1/systemone` and `/v1/decisions` for TypeSafe/Jev-compatible decision models such as Ollaya/Laya or hosted Jev-style endpoints. |
 | Model Groups | Same-type routes behind one API model name; round-robin or weighted round-robin. |
+| OAuth provider accounts | Connect a Claude Code, ChatGPT Codex, or xAI Grok subscription from the Portal and route to it with a credential the router renews automatically. Unofficial vendor integrations; see the caveat below. |
 | Fail-safe endpoint handling | A failed endpoint is skipped after repeated pre-response failures and retried after `BACKEND_CIRCUIT_OPEN_SECONDS`, default `30`. |
 | Teams, keys, budgets | Team budgets, visible client API keys, expiry, request-per-minute limits, concurrency limits, and usage dashboard. |
 
@@ -164,6 +165,27 @@ Open **Models & Routes → Add model route** in the Portal.
 8. Save the route only after the test passes.
 
 The provider API key belongs to the model route. Client applications do not receive provider keys. They call BrighTO-Router with a client API key issued from the **API Keys** screen.
+
+## Use a subscription account instead of an API key
+
+If you already pay for a Claude Pro/Max, ChatGPT Plus/Pro, or SuperGrok/X Premium+ subscription, you can
+use that account as a provider without buying metered API access.
+
+1. Open **Providers → Connected accounts → Connect account**.
+2. Pick the provider. You sign in on the provider's own site — the router never sees your password.
+   Claude and Codex use a browser sign-in link plus PKCE; xAI uses a device code.
+3. In **Models & Routes → Add model route**, choose that provider. The API-key field is replaced by a
+   **Connected account** picker, and the wizard fills in the protocol, `auth_mode`, and Base URL.
+4. Run **Test connection**, then save enabled.
+
+The credential lives on disk under `DATA_DIR` with owner-only permissions — never in PostgreSQL — and
+the router renews it in the background, one refresh at a time per account.
+
+**What to know before you rely on this.** These are unofficial integrations: the endpoints and client
+identifiers come from the vendors' own CLIs and can change or be withdrawn without notice, and
+Anthropic may bill extra paid usage for traffic that does not originate from the Claude CLI. A
+subscription allowance is shared with that CLI, not doubled. Use a paid API key for anything
+billing-critical. Full detail in [PROVIDERS.md](PROVIDERS.md) and [SECURITY.md](SECURITY.md).
 
 ## System One / Decision routes
 

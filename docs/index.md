@@ -22,6 +22,7 @@ Most teams do not need a large hosted AI platform to start. They need a fast, un
 - Anthropic-compatible `/v1/messages`
 - System One decisions through `/v1/systemone` and `/v1/decisions`
 - Rerank and ASR adapter routes
+- OAuth provider routes for Claude Code, ChatGPT Codex, and xAI Grok subscription accounts, renewed automatically
 - Round-robin and weighted Model Groups for load balancing
 - Team API keys, expiry, token budgets, RPM limits, and concurrency limits
 - PostgreSQL usage ledger and Portal dashboard
@@ -59,4 +60,4 @@ BrighTO-Router publishes deterministic mock-backend benchmarks to measure router
 
 ## Keywords
 
-LLM gateway, LLM router, AI gateway, AI router, OpenAI API proxy, Anthropic API router, self-hosted LLM proxy, model router, model load balancer, SystemOne router, System One decisions, JEV router, DJEV router, Ollaya router, Laya model, fallback routing, token budget, cost reduction, LiteLLM alternative, Bifrost alternative, Rust API gateway.
+LLM gateway, LLM router, AI gateway, AI router, OpenAI API proxy, Anthropic API router, self-hosted LLM proxy, model router, model load balancer, SystemOne router, System One decisions, JEV router, DJEV router, Ollaya router, Laya model, fallback routing, token budget, cost reduction, LiteLLM alternative, Bifrost alternative, Rust API gateway, Claude Code OAuth, ChatGPT Codex OAuth, Grok OAuth.

@@ -33,6 +33,75 @@ The catalog is configured by `PROVIDER_CATALOG` in `.env`. The default catalog i
 
 **OpenAI-compatible** means the backend accepts OpenAI-style routes such as `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`, or `/v1/models` depending on the selected task. Rerank providers are selected by task type because several providers use different request shapes.
 
+## OAuth providers (subscription accounts)
+
+Some subscriptions are usable through the router without a paid API key, by signing in with the
+account the same way the vendor's own CLI does. Three such providers ship with the router:
+
+| Catalog key | Account | `auth_mode` | Route protocol | Flow | Inference base URL |
+|---|---|---|---|---|---|
+| `claude-code` | Claude Pro / Max (Anthropic subscription) | `anthropic_oauth` | `anthropic_messages` | browser + PKCE | `https://api.anthropic.com` |
+| `codex` | ChatGPT Plus / Pro (Codex allowance) | `chatgpt_oauth` | `codex_responses` | browser + PKCE | `https://chatgpt.com/backend-api/codex` |
+| `xai-oauth` | SuperGrok / X Premium+ | `xai_oauth` | `openai_responses` | device code | `https://cli-chat-proxy.grok.com/v1` |
+
+These three are appended to the catalog from a table compiled into the binary, so **you do not have
+to edit `PROVIDER_CATALOG`** to see them. Listing one in `PROVIDER_CATALOG` yourself also works and
+takes precedence, which is the supported way to point a provider at a gateway that forwards to the
+real upstream path. Do not do that casually: Codex needs the `/backend-api/codex` path prefix, and a
+bare host makes every request fail with a 404.
+
+### Connecting an account
+
+In the Portal, open **Providers → Connected accounts → Connect account**.
+
+- **Browser + PKCE** (Claude, Codex): click *Get sign-in link*, sign in on the provider's own site,
+  then paste the URL your browser was redirected to. The browser shows a connection error because
+  nothing is listening on the loopback address — that is expected, and the URL in the address bar is
+  what you need.
+- **Device code** (xAI): click *Get sign-in code*, type the short code on the provider's page, then
+  press *Check approval*. The Portal keeps checking on the interval the provider asked for.
+
+You never see or paste a password: the login happens on the provider's site. What the router stores
+is the resulting credential, on disk, owner-readable only.
+
+### Using the account on a route
+
+Add the account in **Models & Routes → Add model route**. Choosing an OAuth provider replaces the
+API-key field with a **Connected account** picker; the route stores a *reference*
+(`oauth:<provider>:<account>`), never a token. The wizard fills in `auth_mode`, the route protocol,
+and the base URL for you, and **Test connection** runs the real request.
+
+Only the tasks each subscription actually serves are offered: `claude-code` is Chat only, `codex` is
+Responses only, and `xai-oauth` is either. Saving a route outside that set would create a route that
+can only ever fail.
+
+### Renewal
+
+The router refreshes each credential ahead of its expiry, in a background loop, one refresh at a time
+per account. Codex rotates its refresh token on every use, so concurrent refreshes would spend it —
+this is why refresh is single-flight rather than "usually fine". Accounts appear in
+**Connected accounts** with a status: `Connected`, `Expiring soon`, `Expired — reconnect`, or
+`Connected (no auto-renewal)`. A `409` from the admin API means the credential is unrecoverable and
+needs a fresh sign-in.
+
+### What this costs you, and what can break
+
+These paths are **not** the vendors' supported API integrations. They exist because a subscription
+your account already pays for can be used from a router, and they can stop working without notice.
+
+- Anthropic may require or bill **extra paid usage** for traffic that does not come from the Claude
+  CLI. Check your plan before sending real workloads; use an API key for anything billing-critical.
+- OpenAI, Anthropic, and xAI may change or withdraw the endpoint, the client identifier, or the scope
+  set. A rotation like that invalidates every stored credential at once.
+- xAI's `api.x.ai` rejects consumer OAuth accounts with a `403` spending-limit error even when the
+  subscription quota is available. The router uses the subscription host
+  (`cli-chat-proxy.grok.com`) for this reason.
+- A credential shares its allowance with the vendor's own CLI. Using the router and Codex CLI at the
+  same time means the quota is shared, not doubled.
+
+The Portal shows each provider's risk note before you start a flow, and the same notes are in
+[SECURITY.md](SECURITY.md).
+
 
 ## Default seeded provider endpoints
 
@@ -123,6 +192,18 @@ Provider API keys are different from client API keys.
 - Client API key: used by your app/team to call BrighTO.
 
 Create client keys in **API Keys**. Admin can view and copy them again later.
+
+## Credential storage
+
+| Credential kind | Reference | Where the secret lives | Who can read it |
+|---|---|---|---|
+| `.env` variable | `env:OPENAI_API_KEY` | the process environment | the router process only |
+| Pasted provider key | `file:/var/lib/brighto-router/provider_keys/<hash>.key` | one file per route, mode `0600` | the router process, and root |
+| OAuth account | `oauth:codex:default` | `$DATA_DIR/oauth/<provider>_<label>.json`, mode `0600` in a `0700` directory | the router process, and root |
+
+The database only ever stores the reference. OAuth access tokens are **never** written to the
+database, never returned by an admin endpoint, and never included in a request log line. Disconnecting
+an account deletes the file; routes that still reference it are reported rather than silently broken.
 
 ## Adapter providers
 

@@ -395,6 +395,133 @@ def full_playwright_spec(base_url: str, admin_key: str, mock_url: str) -> str:
           await expect(page.locator('#content')).toContainText('audit-chat-renamed');
         }}
 
+        async function auditOAuthUi(page) {{
+          /* The OAuth connect flow reaches Anthropic/OpenAI/xAI's own login pages, which this
+             audit must not touch. Everything below is checkable without a login: the provider
+             table, the risk disclosure, and the fact that an account-less OAuth preset swaps the
+             API-key field for a connect affordance instead of silently saving a broken route. */
+          const providers = await adminFetch('/admin/oauth/providers');
+          const keys = providers.providers.map(p => p.key).sort();
+          const expected = ['claude-code', 'codex', 'xai-oauth'];
+          if (JSON.stringify(keys) !== JSON.stringify(expected)) {{
+            throw new Error('unexpected OAuth provider set: ' + JSON.stringify(keys));
+          }}
+          for (const p of providers.providers) {{
+            if (!p.risk_note) throw new Error(p.key + ' exposes no risk note; third-party OAuth must disclose it');
+            if (['pkce', 'device_code'].indexOf(p.flow) < 0) throw new Error(p.key + ' has unknown flow ' + p.flow);
+            if (!p.api_base_url) throw new Error(p.key + ' has no api_base_url');
+            if (!p.models || !p.models.length) throw new Error(p.key + ' has no model suggestions');
+          }}
+          const byKey = Object.fromEntries(providers.providers.map(p => [p.key, p]));
+          if (byKey['codex'].api_base_url !== 'https://chatgpt.com/backend-api/codex') {{
+            throw new Error('codex api_base_url changed: ' + byKey['codex'].api_base_url);
+          }}
+
+          /* No account is connected, so the accounts panel must say so and offer Connect. */
+          await nav(page, 'providers', 'Providers');
+          const panel = page.locator('.oauth-account-table');
+          await expect(page.locator('#content')).toContainText('Connected accounts');
+          await expect(page.locator('#content')).toContainText('No account connected yet');
+          if (await panel.count()) throw new Error('account table rendered with zero connected accounts');
+
+          await page.getByRole('button', {{ name: /^Connect account$/ }}).click();
+          let modal = page.locator('#modal-overlay .modal').last();
+          await expect(modal).toContainText('Connect an account');
+          await expect(modal.locator('.oauth-risk')).toBeVisible();
+          /* The device-code provider must not show a PKCE paste box, and vice versa. */
+          await modal.locator('select').first().selectOption('xai-oauth');
+          await expect(modal.getByRole('button', {{ name: /^Get sign-in code$/ }})).toBeVisible();
+          await expect(modal).not.toContainText('Paste the URL your browser was redirected to');
+          await modal.locator('select').first().selectOption('claude-code');
+          await expect(modal.getByRole('button', {{ name: /^Get sign-in link$/ }})).toBeVisible();
+          await modal.getByRole('button', {{ name: /^Cancel$/ }}).click();
+          await expect(page.locator('#modal-overlay')).toHaveClass(/hidden/);
+
+          /* Selecting an OAuth preset must replace the API-key field with the account picker. */
+          const addModel = await openAddModel(page);
+          const taskSelect = addModel.locator('select').nth(0);
+          const providerSelect = addModel.locator('select').nth(1);
+          /* The provider list is filtered by task, and Codex only serves Responses — so with the
+             default task it must be absent, and present once the task is one it supports. */
+          await expect(providerSelect.locator('option[value="codex"]')).toHaveCount(0);
+          await expect(providerSelect.locator('option[value="claude-code"]')).toHaveCount(1);
+          await taskSelect.selectOption('responses');
+          await expect(providerSelect.locator('option[value="codex"]')).toHaveCount(1);
+          await expect(providerSelect.locator('option[value="claude-code"]')).toHaveCount(0);
+          await taskSelect.selectOption('chat');
+          await providerSelect.selectOption('claude-code');
+          await expect(addModel.locator('.oauth-account-field')).toBeVisible();
+          await expect(addModel.locator('.provider-key-field').first()).toBeHidden();
+          await expect(addModel).toContainText('No account connected');
+          /* With no account there is no credential to test against: refuse rather than send one. */
+          await addModel.locator('input').nth(2).fill('claude-sonnet-4-5');
+          await addModel.getByRole('button', {{ name: /^Test connection$/ }}).click();
+          await expect(page.locator('#toast')).toContainText('Connect an account');
+          /* Without a connection the wizard must still offer the way to get one. */
+          await expect(addModel.getByRole('button', {{ name: /^Connect account$/ }})).toBeVisible();
+          await addModel.getByRole('button', {{ name: /^Cancel$/ }}).click();
+          await expect(page.locator('#modal-overlay')).toHaveClass(/hidden/);
+
+          /* The wizard cannot save an account-less OAuth route, so these three refusals are checked
+             straight through the API: a browser guard that the Portal could regress away is not a
+             guarantee, and the check has to be about the credential, not about the form. */
+          const backend = await adminFetch('/admin/backends', 'POST', {{
+            name: 'audit-oauth-endpoint',
+            base_url: byKey['codex'].api_base_url,
+            api_key_ref: 'env:NONE',
+            weight: 1,
+            max_inflight: 0,
+            format: 'openai',
+            enabled: true,
+          }});
+          const baseRoute = {{
+            backend_ids: [backend.id],
+            provider_model_name: 'gpt-5-codex',
+            enabled: false,
+            auth_mode: 'chatgpt_oauth',
+            protocol: 'codex_responses',
+            first_byte_timeout: 180,
+          }};
+          async function expectRouteRejected(name, body, mustMention) {{
+            let rejected = null;
+            try {{ await adminFetch('/admin/routes', 'POST', Object.assign({{ model_name: name }}, baseRoute, body)); }}
+            catch (e) {{ rejected = String(e.message); }}
+            if (rejected === null) throw new Error('accepted a route that cannot work: ' + name);
+            if (!mustMention.test(rejected)) {{
+              throw new Error(name + ' was refused, but not for the reason under test: ' + rejected);
+            }}
+          }}
+          try {{
+            await expectRouteRejected(
+              'audit-oauth-non-oauth-ref',
+              {{ provider_key_ref: 'env:NOT_A_CREDENTIAL' }},
+              /oauth/i);
+            await expectRouteRejected(
+              'audit-oauth-unconnected-account',
+              {{ provider_key_ref: 'oauth:codex:audit-never-connected' }},
+              /connect|no connected/i);
+            await expectRouteRejected(
+              'audit-oauth-missing-ref',
+              {{}},
+              /oauth|credential/i);
+            /* The reference is the only thing an OAuth route may carry: a pasted key would work for
+               an hour and then fail every request with no way to tell why. */
+            await expectRouteRejected(
+              'audit-oauth-pasted-key',
+              {{ provider_key: 'sk-should-be-refused' }},
+              /connect|account|oauth/i);
+          }} finally {{
+            await adminFetch('/admin/backends/' + backend.id, 'DELETE');
+          }}
+
+          /* The admin responses must never carry token material. */
+          const accounts = await adminFetch('/admin/oauth/accounts');
+          const raw = JSON.stringify(accounts);
+          if (/access_token|refresh_token|code_verifier/.test(raw)) {{
+            throw new Error('account listing leaked token material');
+          }}
+        }}
+
         async function auditProviderKeyFilePath() {{
           const backends = await adminFetch('/admin/backends');
           const backend = backends.find(b => b.name === 'custom-llm') || backends[0];
@@ -482,6 +609,7 @@ def full_playwright_spec(base_url: str, admin_key: str, mock_url: str) -> str:
             await auditNavigation(page);
             await auditProviderEndpointUi(page);
             await auditProviderTaskChoices(page);
+            await auditOAuthUi(page);
             await auditRoutes(page);
             await auditTeamAndKeyUi(page);
             await auditProviderKeyFilePath();

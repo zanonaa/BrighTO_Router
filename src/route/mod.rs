@@ -944,6 +944,7 @@ mod tests {
             provider_key_ref: None,
             auth_mode: "bearer".into(),
             protocol: "openai_chat".into(),
+            oauth_account_id: None,
             weight,
             max_inflight,
             enabled: true,
@@ -981,6 +982,7 @@ mod tests {
             auth_mode: "bearer".into(),
             protocol: "openai_chat".into(),
             provider_key: None,
+            oauth_account_id: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
         }
@@ -1128,6 +1130,7 @@ mod tests {
             auth_mode: "bearer".into(),
             protocol: "openai_chat".into(),
             provider_key: None,
+            oauth_account_id: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
         }

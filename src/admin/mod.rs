@@ -23,11 +23,15 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod oauth_api;
+
 use crate::auth;
 use crate::config::{DbConfigLoader, resolve_backend_key};
 use crate::contract::{
     ApiKey, AppState, Budget, KeyHash, ModelRoute, ProviderProtocol, RoutingPolicy,
 };
+use crate::oauth;
+use crate::provider_auth::{self, parse_auth_mode};
 
 /// Phân biệt "field bị bỏ qua" (None) với "field = null" (Some(None)) cho Option<Option<T>>.
 /// serde mặc định map null -> None (giống bỏ qua); helper này giữ null -> Some(None).
@@ -266,7 +270,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Router con cho /admin/* — được nest_service vào router chính.
 pub fn router(runtime: Arc<AppState>) -> Router {
-    let state = Arc::new(AdminState::from_env(runtime));
+    let state: Arc<AdminState> = Arc::new(AdminState::from_env(runtime));
 
     Router::new()
         .route("/", get(portal))
@@ -283,6 +287,7 @@ pub fn router(runtime: Arc<AppState>) -> Router {
         .route("/routes/preview-models", post(preview_models))
         .route("/provider-catalog", get(list_provider_catalog))
         .route("/test-connection", post(test_connection))
+        .merge(oauth_api::routes())
         .route(
             "/routes/{model_name}",
             patch(patch_route).delete(delete_route),
@@ -1311,7 +1316,7 @@ async fn preview_models(
         .unwrap_or("bearer")
         .trim()
         .to_string();
-    let key = resolve_route_key(
+    let (key, oauth_account_id) = resolve_route_key(
         payload.provider_key.as_deref(),
         payload.provider_key_ref.as_deref(),
     )?;
@@ -1329,17 +1334,16 @@ async fn preview_models(
         .get(url)
         .timeout(Duration::from_secs(15));
     if auth_mode != "none" && !key.is_empty() {
-        match protocol {
-            "openai" => {
-                req = req.bearer_auth(key);
-            }
-            "anthropic" => {
-                req = req
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01");
-            }
-            _ => {}
-        }
+        // Same plan the proxy will use, so a green preview means the real route works.
+        let plan = provider_auth::resolve(
+            &auth_mode,
+            protocol == "anthropic",
+            oauth_account_id.as_deref(),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        provider_auth::apply_headers(&mut headers, &plan, &key)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+        req = req.headers(headers);
     }
     let resp = req
         .send()
@@ -1407,11 +1411,52 @@ struct ProviderCatalogEntry {
     key_set: bool,
     /// false = "coming soon"/experimental (Gemini, Meta Muse) — hiển thị nhưng không chọn được.
     enabled: bool,
+    /// true khi entry khớp một `OAuthProviderSpec` (key trùng `OAuthProviderSpec::key`).
+    /// Portal thay ô nhập API key bằng nút "Connect account". Không thêm cột mới vào
+    /// `PROVIDER_CATALOG`: suy ra từ key giữ format pipe cũ nguyên vẹn.
+    oauth: bool,
+    /// "pkce" | "device_code" — quyết định affordance nào Portal hiển thị.
+    oauth_flow: Option<&'static str>,
+    /// `auth_mode` mà route của credential này phải dùng.
+    oauth_auth_mode: Option<&'static str>,
+    /// Rủi ro bên thứ ba, hiển thị trước khi operator bắt đầu flow.
+    oauth_risk_note: Option<&'static str>,
 }
 
 /// Danh sách provider cố định, hard-coded trong .env qua PROVIDER_CATALOG.
 /// Định dạng mỗi entry: key|label|base_url|dialect|key_env|enabled(1/0), phân tách bằng ';'.
 /// Chỉ 2 dialect (openai/anthropic); phần còn lại chỉ là base URL khác nhau của cùng 1 dialect.
+/// OAuth metadata for a catalog key, or all-`None` for a plain API-key provider.
+///
+/// Derived from the key rather than stored in `PROVIDER_CATALOG`, so the existing pipe-delimited
+/// format — and every deployment's `.env` — keep working unchanged.
+struct OAuthCatalogHint {
+    oauth: bool,
+    flow: Option<&'static str>,
+    auth_mode: Option<&'static str>,
+    risk_note: Option<&'static str>,
+}
+
+fn oauth_hint(key: &str) -> OAuthCatalogHint {
+    match oauth::spec(key) {
+        Some(spec) => OAuthCatalogHint {
+            oauth: true,
+            flow: Some(match spec.flow {
+                oauth::OAuthFlow::Pkce => "pkce",
+                oauth::OAuthFlow::DeviceCode => "device_code",
+            }),
+            auth_mode: Some(spec.auth_mode),
+            risk_note: Some(spec.risk_note),
+        },
+        None => OAuthCatalogHint {
+            oauth: false,
+            flow: None,
+            auth_mode: None,
+            risk_note: None,
+        },
+    }
+}
+
 fn provider_env_key_set(key_env: &str) -> bool {
     std::env::var(key_env)
         .map(|v| !v.trim().is_empty())
@@ -1451,18 +1496,23 @@ fn provider_catalog_from_env() -> Vec<ProviderCatalogEntry> {
                     .map(|v| !v.trim().is_empty())
                     .unwrap_or(false)
             };
+            let hint = oauth_hint(&key);
             Some(ProviderCatalogEntry {
-                key,
-                label,
-                base_url,
                 dialect: if dialect == "anthropic" {
                     "anthropic".into()
                 } else {
                     "openai".into()
                 },
+                key,
+                label,
+                base_url,
                 key_env,
                 key_set,
                 enabled,
+                oauth: hint.oauth,
+                oauth_flow: hint.flow,
+                oauth_auth_mode: hint.auth_mode,
+                oauth_risk_note: hint.risk_note,
             })
         })
         .collect();
@@ -1494,6 +1544,42 @@ fn provider_catalog_from_env() -> Vec<ProviderCatalogEntry> {
             key_env: key_env.to_string(),
             key_set,
             enabled: true,
+            oauth: false,
+            oauth_flow: None,
+            oauth_auth_mode: None,
+            oauth_risk_note: None,
+        });
+    }
+    // OAuth providers are appended from the spec table rather than from PROVIDER_CATALOG, so
+    // an operator upgrading the binary gets them without also editing their .env. The table is
+    // the single source of truth; a catalog entry with the same key simply wins, so an operator
+    // can still override the base URL (for example to point at a gateway).
+    for spec in oauth::PROVIDERS {
+        if entries.iter().any(|e| e.key == spec.key) {
+            continue;
+        }
+        entries.push(ProviderCatalogEntry {
+            key: spec.key.to_string(),
+            label: spec.label.to_string(),
+            base_url: spec.api_base_url.to_string(),
+            // Claude speaks the Anthropic dialect; Codex and xAI speak OpenAI-compatible.
+            dialect: if spec.auth_mode == provider_auth::OAUTH_AUTH_MODE_ANTHROPIC {
+                "anthropic".to_string()
+            } else {
+                "openai".to_string()
+            },
+            // Empty: there is no env var holding a managed OAuth access token, so the Portal must
+            // not claim a key is "already set in .env".
+            key_env: String::new(),
+            key_set: false,
+            enabled: true,
+            oauth: true,
+            oauth_flow: Some(match spec.flow {
+                oauth::OAuthFlow::Pkce => "pkce",
+                oauth::OAuthFlow::DeviceCode => "device_code",
+            }),
+            oauth_auth_mode: Some(spec.auth_mode),
+            oauth_risk_note: Some(spec.risk_note),
         });
     }
     entries
@@ -1510,20 +1596,37 @@ async fn list_provider_catalog(
 
 // ===== Test connection =====
 
-/// Resolve key cho preview/test/route: plaintext ưu tiên; nếu không có thì resolve ref (env:/file:).
-fn resolve_route_key(plain: Option<&str>, r#ref: Option<&str>) -> Result<String, ApiError> {
+/// Resolve key cho preview/test/route: plaintext ưu tiên; nếu không có thì resolve ref
+/// (env:/file:/oauth:).
+///
+/// Returns the access token plus the OAuth account id, which Codex requires on every request.
+fn resolve_route_key(
+    plain: Option<&str>,
+    r#ref: Option<&str>,
+) -> Result<(String, Option<String>), ApiError> {
     if let Some(p) = plain.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(p.to_string());
+        return Ok((p.to_string(), None));
     }
     if let Some(r) = r#ref.map(str::trim).filter(|s| !s.is_empty()) {
-        return resolve_backend_key(r).ok_or_else(|| {
+        if oauth::parse_credential_ref(r).is_some() {
+            let (key, account) =
+                oauth::resolve_route_credential(&oauth::OAuthTokenStore::from_env(), r);
+            let key = key.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("cannot resolve OAuth credential reference: {r}"),
+                )
+            })?;
+            return Ok((key, account));
+        }
+        return resolve_backend_key(r).map(|k| (k, None)).ok_or_else(|| {
             ApiError::new(
                 StatusCode::BAD_REQUEST,
                 format!("cannot resolve provider key reference: {r}"),
             )
         });
     }
-    Ok(String::new())
+    Ok((String::new(), None))
 }
 
 #[derive(Deserialize)]
@@ -1550,27 +1653,29 @@ struct TestConnectionResponse {
     detail: Option<String>,
 }
 
+/// Attach the route's credential to a probe request.
+///
+/// Goes through `provider_auth::apply_headers` — the same function the proxy uses — so a green
+/// "Test connection" proves the real upstream request carries an identical credential and the
+/// identical credential-scoped provider headers (`anthropic-beta`, `chatgpt-account-id`).
 fn add_provider_auth(
     req: reqwest::RequestBuilder,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder, String> {
     if key.is_empty() {
-        return req;
+        return Ok(req);
     }
-    if dialect == "anthropic" {
-        req.header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-    } else {
-        req.bearer_auth(key)
-    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    provider_auth::apply_headers(&mut headers, plan, key)?;
+    Ok(req.headers(headers))
 }
 
 async fn post_json_probe(
     state: &Arc<AdminState>,
     base_url: &str,
     route: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     body: serde_json::Value,
     timeout_secs: u64,
@@ -1582,7 +1687,7 @@ async fn post_json_probe(
         .post(url)
         .timeout(Duration::from_secs(timeout_secs))
         .json(&body);
-    let resp = add_provider_auth(req, dialect, key)
+    let resp = add_provider_auth(req, plan, key)?
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -1596,6 +1701,7 @@ async fn test_chat_completion(
     state: &Arc<AdminState>,
     base_url: &str,
     dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, Option<serde_json::Value>), String> {
@@ -1610,13 +1716,13 @@ async fn test_chat_completion(
     } else {
         serde_json::json!({"model": model, "max_tokens": 1, "stream": false, "messages": [{"role":"user","content":"ping"}]})
     };
-    post_json_probe(state, base_url, route, dialect, key, body, 20).await
+    post_json_probe(state, base_url, route, plan, key, body, 20).await
 }
 
 async fn test_text_completion(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, Option<serde_json::Value>), String> {
@@ -1626,13 +1732,13 @@ async fn test_text_completion(
         "max_tokens": 1,
         "stream": false
     });
-    post_json_probe(state, base_url, "/v1/completions", dialect, key, body, 20).await
+    post_json_probe(state, base_url, "/v1/completions", plan, key, body, 20).await
 }
 
 async fn test_responses(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, Option<serde_json::Value>), String> {
@@ -1642,13 +1748,13 @@ async fn test_responses(
         "max_output_tokens": 1,
         "stream": false
     });
-    post_json_probe(state, base_url, "/v1/responses", dialect, key, body, 20).await
+    post_json_probe(state, base_url, "/v1/responses", plan, key, body, 20).await
 }
 
 async fn test_embedding(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, bool, String), String> {
@@ -1665,7 +1771,7 @@ async fn test_embedding(
         body["embedding_type"] = serde_json::Value::String("float".to_string());
     }
     let (status, data) =
-        post_json_probe(state, base_url, "/v1/embeddings", dialect, key, body, 30).await?;
+        post_json_probe(state, base_url, "/v1/embeddings", plan, key, body, 30).await?;
     let dim = data
         .as_ref()
         .and_then(|v| v.get("data"))
@@ -1718,7 +1824,7 @@ fn qwen_rerank_probe(model: &str) -> (&'static str, serde_json::Value) {
 async fn test_rerank(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
     protocol: ProviderProtocol,
@@ -1742,7 +1848,7 @@ async fn test_rerank(
         }
         ("/v1/rerank", body)
     };
-    let (status, data) = post_json_probe(state, base_url, route, dialect, key, body, 30).await?;
+    let (status, data) = post_json_probe(state, base_url, route, plan, key, body, 30).await?;
     let results = data
         .as_ref()
         .and_then(|v| {
@@ -1770,7 +1876,7 @@ async fn test_rerank(
 async fn test_systemone(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, bool, String), String> {
@@ -1790,7 +1896,7 @@ async fn test_systemone(
         }
     });
     let (status, data) =
-        post_json_probe(state, base_url, "/v1/systemone", dialect, key, body, 30).await?;
+        post_json_probe(state, base_url, "/v1/systemone", plan, key, body, 30).await?;
     let answers = data
         .as_ref()
         .and_then(|v| v.get("answers"))
@@ -1806,7 +1912,7 @@ async fn test_systemone(
 async fn test_asr(
     state: &Arc<AdminState>,
     base_url: &str,
-    dialect: &str,
+    plan: &provider_auth::AuthPlan<'_>,
     key: &str,
     model: &str,
 ) -> Result<(u16, bool, String), String> {
@@ -1835,7 +1941,7 @@ async fn test_asr(
             format!("multipart/form-data; boundary={boundary}"),
         )
         .body(body);
-    let resp = add_provider_auth(req, dialect, key)
+    let resp = add_provider_auth(req, plan, key)?
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -1865,8 +1971,19 @@ async fn test_connection(
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
     let base_url = non_empty_trimmed(payload.base_url, "base_url")?;
     let dialect = normalize_backend_format(&payload.dialect)?;
-    let auth_mode = payload.auth_mode.trim().to_string();
-    let key = resolve_route_key(
+    let auth_mode = parse_auth_mode(payload.auth_mode.trim())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "auth_mode must be one of {}, got: {}",
+                    provider_auth::AUTH_MODES.join(", "),
+                    payload.auth_mode.trim()
+                ),
+            )
+        })?;
+    let (key, oauth_account_id) = resolve_route_key(
         payload.provider_key.as_deref(),
         payload.provider_key_ref.as_deref(),
     )?;
@@ -1898,34 +2015,39 @@ async fn test_connection(
             }
         });
     let started = std::time::Instant::now();
+    // Same plan the proxy will build for this route, so a green probe is evidence the route will
+    // serve traffic — not just that the base URL answers.
+    let plan = provider_auth::resolve(
+        &auth_mode,
+        dialect == "anthropic",
+        oauth_account_id.as_deref(),
+    );
     let tested = match protocol {
-        ProviderProtocol::OpenAiResponses => {
-            test_responses(&state, &base_url, dialect, &key, model)
+        ProviderProtocol::OpenAiResponses | ProviderProtocol::CodexResponses => {
+            test_responses(&state, &base_url, &plan, &key, model)
                 .await
                 .map(|(status, _)| (status, status < 400, "responses OK".to_string()))
         }
         ProviderProtocol::OpenAiCompletions => {
-            test_text_completion(&state, &base_url, dialect, &key, model)
+            test_text_completion(&state, &base_url, &plan, &key, model)
                 .await
                 .map(|(status, _)| (status, status < 400, "completions OK".to_string()))
         }
         ProviderProtocol::OpenAiEmbeddings => {
-            test_embedding(&state, &base_url, dialect, &key, model).await
+            test_embedding(&state, &base_url, &plan, &key, model).await
         }
         ProviderProtocol::OpenAiRerank
         | ProviderProtocol::QwenRerank
         | ProviderProtocol::CohereRerank
         | ProviderProtocol::VoyageRerank
         | ProviderProtocol::JinaRerank => {
-            test_rerank(&state, &base_url, dialect, &key, model, protocol).await
+            test_rerank(&state, &base_url, &plan, &key, model, protocol).await
         }
         ProviderProtocol::OpenAiAudioTranscriptions => {
-            test_asr(&state, &base_url, dialect, &key, model).await
+            test_asr(&state, &base_url, &plan, &key, model).await
         }
-        ProviderProtocol::SystemOne => {
-            test_systemone(&state, &base_url, dialect, &key, model).await
-        }
-        _ => test_chat_completion(&state, &base_url, dialect, &key, model)
+        ProviderProtocol::SystemOne => test_systemone(&state, &base_url, &plan, &key, model).await,
+        _ => test_chat_completion(&state, &base_url, dialect, &plan, &key, model)
             .await
             .map(|(status, _)| (status, status < 400, "chat/messages OK".to_string())),
     };
@@ -2002,18 +2124,61 @@ fn protocol_family(protocol: &str) -> &'static str {
         ProviderProtocol::OpenAiAudioTranscriptions => "openai_audio_transcriptions",
         ProviderProtocol::SystemOne => "systemone",
         ProviderProtocol::AnthropicMessages => "anthropic_messages",
+        // Same client-facing wire shape as OpenAI Responses, so a Model Group endpoint may sit on
+        // either; the difference is the upstream path and the account header.
+        ProviderProtocol::CodexResponses => "openai_responses",
     }
 }
 
 fn validate_key_ref(value: &str) -> Result<String, ApiError> {
     let r = value.trim();
+    if r.starts_with("oauth:") {
+        return validate_oauth_key_ref(r);
+    }
     if !(r.starts_with("env:") || r.starts_with("file:")) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "provider_key_ref must be env:NAME or file:/path",
+            "provider_key_ref must be env:NAME, file:/path or oauth:<provider>:<account>",
         ));
     }
     Ok(r.to_string())
+}
+
+/// An `oauth:` reference must name a provider this build knows about, otherwise the route would
+/// load with no credential and fail every request with an opaque 401.
+fn validate_oauth_key_ref(reference: &str) -> Result<String, ApiError> {
+    let Some((provider, label)) = oauth::parse_credential_ref(reference) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "oauth provider_key_ref must be oauth:<provider>:<account>",
+        ));
+    };
+    if oauth::spec(provider).is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown OAuth provider '{provider}'; known providers: {}",
+                oauth::PROVIDERS
+                    .iter()
+                    .map(|s| s.key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    if oauth::OAuthTokenStore::from_env()
+        .read(provider, label)
+        .is_err()
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "no connected OAuth account '{label}' for provider '{provider}'; \
+                 connect it first via POST /admin/oauth/{provider}/start"
+            ),
+        ));
+    }
+    Ok(reference.to_string())
 }
 
 fn write_route_endpoint_key_file(
@@ -2083,22 +2248,22 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| model_name.clone());
     let enabled = payload.enabled.unwrap_or(true);
-    let auth_mode = match payload.auth_mode.as_deref().unwrap_or("bearer").trim() {
-        "bearer" | "anthropic" | "none" => payload
-            .auth_mode
-            .as_deref()
-            .unwrap_or("bearer")
-            .trim()
-            .to_string(),
-        other => {
+    let auth_mode = match parse_auth_mode(payload.auth_mode.as_deref().unwrap_or("bearer")) {
+        Some(m) => m.to_string(),
+        None => {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                format!("auth_mode must be bearer, anthropic or none, got: {other}"),
+                format!(
+                    "auth_mode must be one of {}, got: {}",
+                    provider_auth::AUTH_MODES.join(", "),
+                    payload.auth_mode.as_deref().unwrap_or("bearer").trim()
+                ),
             ));
         }
     };
     // Route-level protocol (CODEX taxonomy). Default: anthropic auth -> anthropic_messages,
-    // ngược lại openai_chat. Client có thể ghi đè tường minh.
+    // OAuth auth -> provider's own protocol, ngược lại openai_chat. Client có thể ghi đè
+    // tường minh.
     let protocol = match payload
         .protocol
         .as_deref()
@@ -2106,13 +2271,11 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
         .filter(|s| !s.is_empty())
     {
         Some(p) => ProviderProtocol::parse(p).as_str().to_string(),
-        None => {
-            if auth_mode == "anthropic" {
-                "anthropic_messages".to_string()
-            } else {
-                "openai_chat".to_string()
-            }
-        }
+        None => match oauth::spec_for_auth_mode(&auth_mode) {
+            Some(spec) => spec.protocol.to_string(),
+            None if auth_mode == "anthropic" => "anthropic_messages".to_string(),
+            None => "openai_chat".to_string(),
+        },
     };
     // Ghi provider key (plaintext) ra file secrets nếu được cung cấp; chỉ lưu ref.
     let provider_key_ref = match payload
@@ -2126,6 +2289,18 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "provider key must be empty when auth_mode is none",
+                ));
+            }
+            if provider_auth::is_oauth_mode(&auth_mode) {
+                // A pasted OAuth access token expires within the hour and the router has no
+                // refresh token to renew it. Accepting one would produce a route that works
+                // briefly and then fails every request.
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "auth_mode {auth_mode} needs a connected OAuth account, not a pasted key; \
+                         use provider_key_ref oauth:<provider>:<account>"
+                    ),
                 ));
             }
             let data_dir =
@@ -2182,22 +2357,20 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                         format!("duplicate endpoint backend_id {}", item.backend_id),
                     ));
                 }
-                let endpoint_auth = match item.auth_mode.as_deref().unwrap_or(&auth_mode).trim() {
-                    "bearer" | "anthropic" | "none" => item
-                        .auth_mode
-                        .as_deref()
-                        .unwrap_or(&auth_mode)
-                        .trim()
-                        .to_string(),
-                    other => {
-                        return Err(ApiError::new(
-                            StatusCode::BAD_REQUEST,
-                            format!(
-                                "endpoint auth_mode must be bearer, anthropic or none, got: {other}"
-                            ),
-                        ));
-                    }
-                };
+                let endpoint_auth =
+                    match parse_auth_mode(item.auth_mode.as_deref().unwrap_or(&auth_mode).trim()) {
+                        Some(m) => m.to_string(),
+                        None => {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "endpoint auth_mode must be one of {}, got: {}",
+                                    provider_auth::AUTH_MODES.join(", "),
+                                    item.auth_mode.as_deref().unwrap_or(&auth_mode).trim()
+                                ),
+                            ));
+                        }
+                    };
                 let endpoint_protocol = item
                     .protocol
                     .as_deref()
@@ -2225,6 +2398,16 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                             return Err(ApiError::new(
                                 StatusCode::BAD_REQUEST,
                                 "endpoint provider key must be empty when auth_mode is none",
+                            ));
+                        }
+                        if provider_auth::is_oauth_mode(&endpoint_auth) {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "auth_mode {endpoint_auth} needs a connected OAuth account, \
+                                     not a pasted key; use provider_key_ref \
+                                     oauth:<provider>:<account>"
+                                ),
                             ));
                         }
                         Some(write_route_endpoint_key_file(

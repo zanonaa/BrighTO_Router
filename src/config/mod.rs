@@ -11,6 +11,57 @@ use crate::contract::{
     ApiKey, Backend, BackendFormat, Budget, ConfigSnapshot, KeyHash, ModelEndpoint, ModelRoute,
     ProviderProtocol, RoutingPolicy, Team,
 };
+use crate::oauth;
+use crate::provider_auth::is_oauth_mode;
+
+/// Route credential resolved once, at config-load time: the header-carrying secret plus any
+/// per-credential OAuth metadata. Keeping the two together means one read of the token file per
+/// route per poll, and it leaves the hot path with a plain value and nothing left to resolve.
+struct ResolvedCredential {
+    key: Option<String>,
+    oauth_account_id: Option<Arc<str>>,
+}
+
+/// Resolve a route/endpoint credential reference.
+///
+/// `oauth:<provider>:<label>` reads the token file and yields a short-lived access token plus
+/// the account id Codex requires. Every other reference keeps the existing `env:` / `file:`
+/// behavior, so no existing deployment changes meaning.
+fn resolve_credential(auth_mode: &str, reference: &str) -> ResolvedCredential {
+    if !is_oauth_mode(auth_mode) {
+        return ResolvedCredential {
+            key: resolve_backend_key(reference),
+            oauth_account_id: None,
+        };
+    }
+    let store = oauth::OAuthTokenStore::from_env();
+    let (key, account_id) = oauth::resolve_route_credential(&store, reference);
+    ResolvedCredential {
+        key,
+        oauth_account_id: account_id.map(Arc::from),
+    }
+}
+
+/// Resolve a route/endpoint credential into the two values the snapshot carries.
+///
+/// `auth_mode = none` means the provider needs no credential at all (local llama.cpp / vLLM), and
+/// a route with no `provider_key_ref` inherits its backend's key at forward time — both yield
+/// `None` here, exactly as before OAuth existed.
+fn resolve_route_credential_pair(
+    auth_mode: &str,
+    reference: Option<&str>,
+) -> (Option<String>, Option<Arc<str>>) {
+    if auth_mode == "none" {
+        return (None, None);
+    }
+    match reference {
+        Some(reference) => {
+            let c = resolve_credential(auth_mode, reference);
+            (c.key, c.oauth_account_id)
+        }
+        None => (None, None),
+    }
+}
 
 pub struct DbConfigLoader {
     pub pool: PgPool,
@@ -145,13 +196,8 @@ impl DbConfigLoader {
             // Resolve route-level credential (nếu có). Khi route không có credential riêng, để
             // provider_key = None; proxy sẽ dùng backend.api_key của backend được chọn tại thời điểm
             // forward (mỗi backend có key riêng, kể cả fallback/secondary).
-            let provider_key = if auth_mode == "none" {
-                None
-            } else if let Some(kr) = &provider_key_ref {
-                resolve_backend_key(kr)
-            } else {
-                None
-            };
+            let (provider_key, oauth_account_id) =
+                resolve_route_credential_pair(&auth_mode, provider_key_ref.as_deref());
             let endpoints = endpoint_overrides.remove(&model_name).unwrap_or_default();
             out.push(ModelRoute {
                 model_name,
@@ -169,6 +215,7 @@ impl DbConfigLoader {
                 auth_mode,
                 protocol,
                 provider_key,
+                oauth_account_id,
                 routing_policy,
                 endpoints,
             });
@@ -199,13 +246,8 @@ impl DbConfigLoader {
             let weight = g_i64(&row, 6)?.max(1);
             let max_inflight = g_i64(&row, 7)?.max(0);
             let enabled = g_bool(&row, 8)?;
-            let provider_key = if auth_mode == "none" {
-                None
-            } else if let Some(kr) = &provider_key_ref {
-                resolve_backend_key(kr)
-            } else {
-                None
-            };
+            let (provider_key, oauth_account_id) =
+                resolve_route_credential_pair(&auth_mode, provider_key_ref.as_deref());
             out.entry(model_name).or_default().insert(
                 backend_id,
                 ModelEndpoint {
@@ -218,6 +260,7 @@ impl DbConfigLoader {
                     max_inflight: u32::try_from(max_inflight).unwrap_or(0),
                     enabled,
                     provider_key,
+                    oauth_account_id,
                 },
             );
         }
