@@ -133,6 +133,7 @@ async fn model_group_weighted_round_robin_three_endpoint_smoke(pool: PgPool) {
         ledger: LedgerSink::new(ptx, otx),
         metrics: metrics(),
         max_body_bytes: 10 * 1024 * 1024,
+        quota: Arc::new(brighto_router::quota::QuotaStore::new()),
         reload_notify: Arc::new(tokio::sync::Notify::new()),
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),

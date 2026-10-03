@@ -61,6 +61,7 @@ Honest read: Model Groups add routing choice, per-endpoint model rewrite, Postgr
 | System One / decisions | `/v1/systemone` and `/v1/decisions` for TypeSafe/Jev-compatible decision models such as Ollaya/Laya or hosted Jev-style endpoints. |
 | Model Groups | Same-type routes behind one API model name; round-robin or weighted round-robin. |
 | OAuth provider accounts | Connect a Claude Code, ChatGPT Codex, or xAI Grok subscription from the Portal and route to it with a credential the router renews automatically. Unofficial vendor integrations; see the caveat below. |
+| Allowance (quota) display | Per-account quota readout (5-hour / weekly / monthly windows) from response headers and on-demand probes. Display only — it never steers routing. |
 | Fail-safe endpoint handling | A failed endpoint is skipped after repeated pre-response failures and retried after `BACKEND_CIRCUIT_OPEN_SECONDS`, default `30`. |
 | Teams, keys, budgets | Team budgets, visible client API keys, expiry, request-per-minute limits, concurrency limits, and usage dashboard. |
 

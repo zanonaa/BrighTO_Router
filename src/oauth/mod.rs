@@ -44,6 +44,39 @@ pub enum BodyEncoding {
     Json,
 }
 
+/// JSON shape a provider's quota endpoint returns.
+///
+/// This is the one place PR #2 admits a per-provider branch, and it is deliberate: the three
+/// responses genuinely do not share a structure. Claude returns named windows keyed by window
+/// name, Codex returns a rate-limit object with fixed primary/secondary slots, and xAI returns
+/// protobuf-JSON with numbers wrapped in `{ val: n }`. A single generic parser over those would
+/// be guesswork dressed as generality. Everything else about a probe — URL, headers, caching,
+/// cooldown, staleness — is data or shared code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaShape {
+    /// `utilization` windows keyed by name (`five_hour`, `seven_day`, `seven_day_<model>`, …).
+    Claude,
+    /// `rate_limits.primary_window` / `.secondary_window`.
+    Codex,
+    /// Protobuf-JSON: numbers arrive as `{ val: n }`.
+    Xai,
+}
+
+/// How to ask one provider for its quota.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaProbeSpec {
+    /// Appended to `quota_base_url`.
+    pub path: &'static str,
+    /// Query string, appended after `?`. Claude's `cedar_ember=1` adds the reset-grant block and
+    /// is the flag Claude Code itself sends.
+    pub query: &'static str,
+    /// Headers required *beyond* the credential. The credential and every OAuth-standard header
+    /// come from `provider_auth::apply_headers`, so a probe request is byte-equivalent to the real
+    /// one; only genuinely extra markers belong here.
+    pub extra_headers: &'static [(&'static str, &'static str)],
+    pub shape: QuotaShape,
+}
+
 /// Everything BrighTO needs to drive one provider's OAuth flow.
 #[derive(Debug, Clone, Copy)]
 pub struct OAuthProviderSpec {
@@ -75,6 +108,9 @@ pub struct OAuthProviderSpec {
     pub api_base_url: &'static str,
     /// Base URL for quota probes, when it differs from the inference base URL.
     pub quota_base_url: &'static str,
+    /// `None` when the provider exposes no quota endpoint. The account is then passive-only, which
+    /// is a real limitation and is documented rather than papered over.
+    pub quota_probe: Option<QuotaProbeSpec>,
     /// Third-party risk, surfaced verbatim in the Portal and documented in SECURITY.md.
     pub risk_note: &'static str,
 }
@@ -100,6 +136,15 @@ const CLAUDE: OAuthProviderSpec = OAuthProviderSpec {
     protocol: "anthropic_messages",
     api_base_url: "https://api.anthropic.com",
     quota_base_url: "https://api.anthropic.com",
+    quota_probe: Some(QuotaProbeSpec {
+        path: "/api/oauth/usage",
+        // The same flag Claude Code sends; it adds the limit-reset grant block.
+        query: "cedar_ember=1",
+        // Nothing extra: `anthropic-beta`, `user-agent` and `anthropic-version` all come from
+        // `apply_headers`, so this request is shaped exactly like a real Claude OAuth request.
+        extra_headers: &[],
+        shape: QuotaShape::Claude,
+    }),
     risk_note: "Anthropic treats third-party OAuth traffic differently from Claude Code itself and \
 may require paid extra usage for this API path. Not covered by your Claude subscription quota \
 unless Anthropic grants it. Use an Anthropic API key for billing-critical accounts.",
@@ -131,6 +176,12 @@ const CODEX: OAuthProviderSpec = OAuthProviderSpec {
     protocol: "codex_responses",
     api_base_url: "https://chatgpt.com/backend-api/codex",
     quota_base_url: "https://chatgpt.com/backend-api",
+    quota_probe: Some(QuotaProbeSpec {
+        path: "/wham/usage",
+        query: "",
+        extra_headers: &[],
+        shape: QuotaShape::Codex,
+    }),
     risk_note: "Codex credentials draw on your ChatGPT Plus/Pro Codex allowance. OpenAI may \
 change or withdraw this path. Shares one account allowance with Codex CLI usage.",
 };
@@ -156,6 +207,16 @@ conversations:write",
     protocol: "openai_responses",
     api_base_url: "https://cli-chat-proxy.grok.com/v1",
     quota_base_url: "https://cli-chat-proxy.grok.com/v1",
+    quota_probe: Some(QuotaProbeSpec {
+        path: "/billing",
+        query: "format=credits",
+        // The billing endpoint is gated on a client marker. Without it the CLI proxy answers 403.
+        extra_headers: &[
+            ("x-xai-token-auth", "xai-grok-cli"),
+            ("x-grok-client-mode", "headless"),
+        ],
+        shape: QuotaShape::Xai,
+    }),
     risk_note: "SuperGrok subscription access through a third-party client. xAI reserves the \
 right to withdraw it, and Grok Code beta may be required for the full model set.",
 };

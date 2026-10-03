@@ -73,6 +73,26 @@ position from holding an API key you were issued, and it is opt-in per account.
 - If a provider revokes the integration, delete the credential files rather than waiting for the
   refresh loop to notice.
 
+## Quota observation
+
+The **Allowance** panel reads provider quota by (a) scanning quota headers on upstream responses and
+(b) optionally asking the provider's quota endpoint with the account's credential. Both are
+read-only observation of data the provider already publishes to its own CLIs.
+
+- **Quota never steers routing.** Nothing here feeds the circuit breaker, endpoint selection, retry,
+  or cooldown. An exhausted account is displayed, not acted on — automatically disabling a backend
+  based on quota is a routing change with its own failure modes, and is deliberately out of scope.
+- **Observation is bounded and allow-listed.** The response-header scan reads at most 64 headers and
+  512 bytes per value, rejects any control byte, and recognises only the three documented header
+  families. Unrecognised or oversized values are ignored, not logged. A malformed value cannot void
+  the rest of the reading.
+- **A probe reuses the router's shared HTTP client and the same header construction as the inference
+  path**, so it reveals nothing about a credential beyond what a normal request already does.
+- **Probe rate is capped per account** (one per minute, plus a three-minute pause after a `429`
+  scoped to the quota endpoint only), so the panel cannot be used to pressure a provider.
+- **Quota responses are not persisted.** Readings live in memory, are replaced wholesale on each
+  observation, and are lost on restart — by design, since a stale quota number is worse than none.
+
 ## Content logging policy
 
 BrighTO-Router stores request metadata for analytics and operations, not conversation content. The PostgreSQL `usage_ledger` records request id, key/team/model/backend identifiers, status, token counts, timing, streaming/client-abort flags, and a short error class. If PostgreSQL is temporarily unavailable, the same event shape is buffered in the local JSONL file configured by `LEDGER_FALLBACK_FILE` and replayed later. It does not store prompts, message arrays, uploaded media, tool payloads, provider response bodies, or model answers.

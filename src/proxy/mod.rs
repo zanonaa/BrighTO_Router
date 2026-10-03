@@ -833,10 +833,20 @@ fn no_backend_body(reason: impl Into<String>) -> Response<Body> {
 async fn forward_backend_response(
     response: reqwest::Response,
     format: BackendFormat,
+    quota_key: Option<&crate::quota::QuotaKey>,
+    quota_store: &crate::quota::QuotaStore,
     mut reporter: CompletionReporter,
 ) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();
+    // The header map is already in memory, so quota observation costs a bounded scan of data we
+    // hold regardless. Returns `None` without allocating when nothing matched, which is the case
+    // for every provider that sends no quota headers.
+    if let Some(key) = quota_key
+        && let Some(windows) = crate::quota::observe::observe_headers(&headers)
+    {
+        quota_store.observe_headers(key, windows);
+    }
     let stream_request = reporter.stream;
 
     if stream_request {
@@ -1289,7 +1299,14 @@ pub async fn proxy_forward(
                     concurrency,
                     l,
                 );
-                let resp = forward_backend_response(resp, backend.format, reporter).await;
+                let resp = forward_backend_response(
+                    resp,
+                    backend.format,
+                    endpoint.quota_key.as_ref(),
+                    &state.quota,
+                    reporter,
+                )
+                .await;
                 return tag_router_headers(
                     resp,
                     &ctx.request_id,

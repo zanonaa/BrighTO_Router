@@ -12,4 +12,5 @@ pub mod metrics;
 pub mod oauth;
 pub mod provider_auth;
 pub mod proxy;
+pub mod quota;
 pub mod route;

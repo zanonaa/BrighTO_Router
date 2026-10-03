@@ -102,6 +102,56 @@ your account already pays for can be used from a router, and they can stop worki
 The Portal shows each provider's risk note before you start a flow, and the same notes are in
 [SECURITY.md](SECURITY.md).
 
+## Allowance (quota) per account
+
+The Portal's **Allowance** panel shows how much of each connected account's allowance is left, per
+window (5-hour session, weekly, monthly). It reads from two places and keeps them apart:
+
+- **Response headers**, observed automatically as traffic flows. Works for every route, including
+  API-key routes, and appears with no extra requests. Only covers the windows the provider puts on
+  its responses.
+- **Active probes** (the **Probe now** button), which ask the provider's own quota endpoint using
+  the account's credential. Authoritative, and the only way to see a monthly cap or a credit
+  balance — but it needs the account's OAuth credential, so **API-key routes are header-only**.
+
+Numbers are shown as `used / total` with the percentage derived at display time. A prepaid credit
+balance is shown as an amount, never as a bar: a balance is not a share of anything, and rendering
+one as a percentage is a real bug class, not a style choice. A window the provider did not report
+reads as **unknown**, which is a different thing from **exhausted**.
+
+Active probes are rate-limited: at most one per account per minute, and a provider that answers
+`429` pauses that account's quota endpoint for three minutes. The pause applies to probing only —
+chat traffic with the same token is unaffected. A failed probe keeps the last good reading and
+flags it stale rather than blanking the panel.
+
+### What each provider reports
+
+The endpoints below are reverse-engineered from the vendors' own CLIs, not documented, and can
+change without notice. The response-header families are the same ones those CLIs read.
+
+| Provider | Probe endpoint | Notes |
+|---|---|---|
+| Claude Code | `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` | `utilization` counts **consumption**: 87 means 13% left. Weekly windows per model family (`seven_day_<model>`) are discovered by name, not enumerated. |
+| Codex | `GET https://chatgpt.com/backend-api/wham/usage` | Windows are classified by `window_minutes` (300 = session, 10080 = weekly) rather than by slot name. `plan_type` is shown as the account's plan. |
+| xAI Grok | `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` | Numbers arrive protobuf-JSON wrapped as `{ "val": n }` and are unwrapped. `cap: 0` with a prepaid balance means "no spend cap"; `cap: 0` with nothing prepaid means **out of credit**, and is shown as a depleted window rather than as unlimited. |
+
+No provider except xAI publishes a monthly figure. For Claude and Codex the panel shows a
+**Monthly (derived)** row interpolated from the weekly window (a month ≈ 4.35 weeks). It is
+labelled as an estimate everywhere it appears and is never mixed into a provider-stated number.
+
+### Verified versus assumed
+
+Endpoint URLs, header names and JSON shapes are taken from the vendors' CLI clients as published,
+and are exercised in `tests/quota_smoke.rs` against mocks that reproduce each shape. They have not
+been confirmed against live paid accounts:
+
+- Anthropic's `*-utilization` response headers are read as **percent used**, matching the
+  `utilization` field on the usage endpoint. If live traffic shows 5-hour windows reading backwards,
+  the fix is one constant (`ANTHROPIC_UTILIZATION_IS_USED_PERCENT` in `src/quota/observe.rs`).
+- Generic `x-ratelimit-*` and IETF `ratelimit-*` headers are deliberately **not** treated as quota:
+  those are per-minute request counters — a rate limit, not an allowance — and mixing the two would
+  mislabel one as the other. `Retry-After` is ignored for the same reason: this subsystem has no
+  timers, and a retry hint that reaches no retry timer is just a misleading number.
 
 ## Default seeded provider endpoints
 

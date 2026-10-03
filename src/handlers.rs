@@ -1018,6 +1018,7 @@ fn rewrite_model_field(body: &[u8], new_model: &str) -> Option<Vec<u8>> {
         protocol: "openai_chat".to_string(),
         provider_key: None,
         oauth_account_id: None,
+        quota_key: None,
         routing_policy: RoutingPolicy::LeastLoadedWeighted,
         endpoints: std::collections::HashMap::new(),
     };
@@ -1127,6 +1128,7 @@ mod tests {
             protocol: "openai_chat".to_string(),
             provider_key: None,
             oauth_account_id: None,
+            quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
         }
@@ -1256,6 +1258,7 @@ mod tests {
             protocol: "openai_chat".to_string(),
             provider_key: None,
             oauth_account_id: None,
+            quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
         };

@@ -91,6 +91,36 @@ The only things a new row must supply are its own facts: authorize/device/token 
 scopes, body encoding, refresh lead, `auth_mode`, protocol, base URLs, model suggestions, and a risk
 note. If a change requires a new `if provider ==` branch anywhere, it belongs in the row instead.
 
+A quota probe is part of the same row (`quota_probe`): path, query, any extra headers, and which
+response shape comes back. Leave it `None` and the account is passive-only — the Portal says so
+instead of showing a spinner.
+
+## Quota smoke
+
+`tests/quota_smoke.rs` drives the real proxy against mock upstreams that reproduce each provider's
+documented quota contract, exactly as `tests/oauth_smoke.rs` does for credentials.
+
+What it pins down, and why each one is worth a test rather than a code review:
+
+- A response carrying quota headers populates the store through the normal proxy path — no admin
+  call, no restart. A response without them leaves the store empty, which is the case that keeps the
+  observation cheap: silence must not cost a snapshot.
+- The admin payload carries `used`/`total` and never a percentage. A reference implementation stored
+  a `remaining` field, a provider put a credit count in it, and the UI rendered "348%". The same
+  class of bug is prevented here at the payload boundary, with an explicit `kind` separating a
+  window from a balance.
+- A credit balance renders as an amount with no percentage band; an unreported limit reads as
+  `unknown` and not as empty. Unknown and exhausted are different statements.
+- A failed probe keeps the previous reading and explains itself, so a provider's bad minute is not
+  indistinguishable from "no allowance".
+- Repeated probes are refused by the per-credential gate without a second upstream request, so a
+  Portal polling loop cannot become provider load.
+
+The probe URL comes from the provider table (a real vendor host), so the prober accepts a per-provider
+base-URL override. That is the seam that makes the HTTP contract testable without a live
+subscription, and it is also what a deployment fronting a provider through a relay needs to point
+the probe at its gateway.
+
 ## System One Ollaya/Laya smoke
 
 To prove System One locally without a paid provider, run:
