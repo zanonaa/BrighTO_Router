@@ -385,15 +385,19 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
 async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.cfg.load_full();
-    let data: Vec<serde_json::Value> = cfg
-        .routes
-        .keys()
-        .map(|m| serde_json::json!({"id": m, "object": "model"}))
+    (StatusCode::OK, axum::Json(models_list_payload(&cfg.routes)))
+}
+
+/// `/v1/models` chỉ liệt kê route đang bật; route disabled không được quảng bá cho client.
+fn models_list_payload(
+    routes: &std::collections::HashMap<String, ModelRoute>,
+) -> serde_json::Value {
+    let data: Vec<serde_json::Value> = routes
+        .iter()
+        .filter(|(_, route)| route.enabled)
+        .map(|(m, _)| serde_json::json!({"id": m, "object": "model"}))
         .collect();
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({ "object": "list", "data": data })),
-    )
+    serde_json::json!({ "object": "list", "data": data })
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> String {
@@ -1265,5 +1269,25 @@ mod tests {
         let body = Bytes::from_static(b"hello world");
         let est = estimate_tokens_len(body.len(), &route);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn models_list_hides_disabled_routes() {
+        let mut enabled = route_for_test("enabled-backend-model");
+        enabled.model_name = "public-on".to_string();
+        let mut disabled = route_for_test("disabled-backend-model");
+        disabled.model_name = "public-off".to_string();
+        disabled.enabled = false;
+        let routes = std::collections::HashMap::from([
+            ("public-on".to_string(), enabled),
+            ("public-off".to_string(), disabled),
+        ]);
+
+        let payload = models_list_payload(&routes);
+        assert_eq!(payload["object"], "list");
+        let data = payload["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "disabled route must be hidden");
+        assert_eq!(data[0]["id"], "public-on");
+        assert_eq!(data[0]["object"], "model");
     }
 }
