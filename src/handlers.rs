@@ -560,9 +560,17 @@ async fn handle_generate(
     }
 
     // 5. Budget reserve + concurrency (RAII: nếu mọi đường return sau đây, tự rollback/release).
+    // OpenCode free lane mutates every chat body (stream pin + tool fingerprint), so it must
+    // take the buffered rewrite path like the other JSON adapters.
+    let opencode_free = crate::opencode_free::is_free_chat_route(
+        &route.auth_mode,
+        protocol,
+        !route.endpoints.is_empty(),
+    );
     let allow_streaming_upload = route.backend_ids.len() == 1
         && route.fallback_backend_id.is_none()
-        && route.endpoints.is_empty();
+        && route.endpoints.is_empty()
+        && !opencode_free;
     let body_len = incoming.body_len();
     let est_tokens = estimate_tokens_len(body_len, &route);
     let (head, proxy_body) = match incoming
@@ -610,6 +618,7 @@ async fn handle_generate(
         ProxyRequestBody::Streaming { .. } => {
             if !route.endpoints.is_empty()
                 || route.provider_model_name != model
+                || opencode_free
                 || protocol == ProviderProtocol::VoyageRerank
                 || protocol == ProviderProtocol::QwenRerank
                 || protocol == ProviderProtocol::SystemOne
@@ -677,6 +686,9 @@ async fn handle_generate(
         stream_options_present,
         protocol,
         rewrite_model_in_proxy,
+        // OpenCode free lane: upstream errors are re-mapped and a non-stream client call gets
+        // the forced SSE folded back into one chat.completion.
+        opencode_free,
         reservation,
         concurrency,
         start: started,
@@ -846,6 +858,7 @@ async fn handle_multipart_adapter(
         stream_options_present: true,
         protocol,
         rewrite_model_in_proxy: false,
+        opencode_free: false,
         reservation,
         concurrency,
         start: started,
@@ -943,6 +956,13 @@ fn json_proxy_body_needs_rewrite(
             protocol,
             ProviderProtocol::QwenRerank | ProviderProtocol::VoyageRerank
         )
+        // The OpenCode free tier gates the chat body (stream pin + tool fingerprint) even when
+        // provider_model_name == public_model, so the model-only short-circuit must not skip it.
+        || crate::opencode_free::is_free_chat_route(
+            &route.auth_mode,
+            protocol,
+            !route.endpoints.is_empty(),
+        )
 }
 
 /// Viết lại JSON buffered nhỏ. Không dùng cho streaming large body.
@@ -975,6 +995,17 @@ fn rewrite_json_proxy_body(
             // Voyage is fully handled: return the (possibly unchanged) normalized body so the
             // caller never reports a false "could not rewrite adapter request body" 400.
             return serde_json::to_vec(&serde_json::Value::Object(obj.clone())).ok();
+        }
+        // OpenCode free tier: pin stream + enforce the tool fingerprint quartet. Must run even
+        // when provider_model_name == public_model, which is why json_proxy_body_needs_rewrite
+        // no longer short-circuits for this auth mode.
+        if crate::opencode_free::is_free_chat_route(
+            &route.auth_mode,
+            protocol,
+            !route.endpoints.is_empty(),
+        ) && crate::opencode_free::adapt_chat_request(obj)
+        {
+            changed = true;
         }
     }
     if changed {
@@ -1184,6 +1215,98 @@ mod tests {
                 .unwrap()
                 .path(),
             "/api/v1/services/rerank/text-rerank/text-rerank"
+        );
+    }
+
+    fn opencode_free_route() -> ModelRoute {
+        // The natural OpenCode free config: provider_model_name == model, no group endpoints.
+        ModelRoute {
+            auth_mode: crate::opencode_free::AUTH_MODE.to_string(),
+            ..route_for_test("free-model")
+        }
+    }
+
+    #[test]
+    fn opencode_free_rewrite_runs_even_when_provider_model_matches() {
+        let route = opencode_free_route();
+        assert_eq!(route.provider_model_name, "free-model");
+        assert!(json_proxy_body_needs_rewrite(
+            &route,
+            "free-model",
+            ProviderProtocol::OpenAiChat
+        ));
+        let body = br#"{"model":"free-model","messages":[{"role":"user","content":"hi"}]}"#;
+        let out = rewrite_json_proxy_body(body, &route, ProviderProtocol::OpenAiChat)
+            .expect("free-tier rewrite must run");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "free-model", "model is not double-rewritten");
+        assert_eq!(v["stream"], true, "upstream must receive stream:true");
+        let names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["bash", "glob", "grep", "read"]);
+        assert_eq!(
+            v["tool_choice"], "none",
+            "no caller tools -> decoys uncallable"
+        );
+    }
+
+    #[test]
+    fn opencode_free_rewrite_canonicalizes_and_keeps_caller_tools() {
+        let route = opencode_free_route();
+        let body = br#"{"model":"free-model","stream":true,"tool_choice":"auto","tools":[
+            {"type":"function","function":{"name":"Bash","description":"cli"}},
+            {"type":"function","function":{"name":"bash","description":"dup"}},
+            {"type":"function","function":{"name":"Grep","description":"search"}},
+            {"type":"function","function":{"name":"MyTool","description":"extra"}}
+        ]}"#;
+        let out = rewrite_json_proxy_body(body, &route, ProviderProtocol::OpenAiChat)
+            .expect("free-tier rewrite must run");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["bash", "grep", "MyTool", "glob", "read"],
+            "canonicalized in place, duplicate dropped, missing appended"
+        );
+        assert_eq!(v["tool_choice"], "auto", "caller tool_choice preserved");
+    }
+
+    #[test]
+    fn opencode_free_rewrite_skips_group_routes_and_non_chat_protocols() {
+        let mut route = opencode_free_route();
+        assert!(!json_proxy_body_needs_rewrite(
+            &route,
+            "free-model",
+            ProviderProtocol::OpenAiResponses
+        ));
+        route.endpoints.insert(
+            7,
+            crate::contract::ModelEndpoint {
+                backend_id: 7,
+                provider_model_name: String::new(),
+                provider_key_ref: None,
+                auth_mode: crate::opencode_free::AUTH_MODE.to_string(),
+                protocol: "openai_chat".to_string(),
+                weight: 1,
+                max_inflight: 0,
+                enabled: true,
+                provider_key: None,
+                oauth_account_id: None,
+                quota_key: None,
+            },
+        );
+        assert!(
+            !json_proxy_body_needs_rewrite(&route, "free-model", ProviderProtocol::OpenAiChat),
+            "Model Groups are out of scope for the free-tier body adapter"
         );
     }
 
