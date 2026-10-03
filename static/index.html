@@ -1306,7 +1306,7 @@ function renderProviders(c){
       var nc=el("td");
       var ns=el("div","stack-cell");
       ns.appendChild(displayNameNode("div","cell-main compact-line",providerDisplayName(b.name),b.name));
-      ns.appendChild(el("div","cell-sub",b.format==="anthropic"?"Anthropic Messages":"OpenAI-compatible"));
+      ns.appendChild(el("div","cell-sub",b.format==="anthropic"?"Anthropic Messages":(b.format==="opencode_free"?"OpenCode Free · no key":"OpenAI-compatible")));
       nc.appendChild(ns);
       tr.appendChild(nc);
       var st=el("td");
@@ -2198,6 +2198,7 @@ function openRouteModal(route,opts){
     var k=(e.key||"").toLowerCase();
     if(e.oauth) return oauthTaskSupported(k,task);
     if(k==="custom" || k==="custom-llm") return true;
+    if(k==="opencode-free") return task==="chat"; // free tier speaks the chat lane only
     if(task==="chat" || task==="responses") return ["jina","voyage","cohere"].indexOf(k)<0;
     if(task==="completion") return ["anthropic","jina","voyage","cohere","ollaya"].indexOf(k)<0;
     if(task==="embedding") return ["openai","jina","voyage","qwen","custom-llm"].indexOf(k)>=0;
@@ -2234,7 +2235,7 @@ function openRouteModal(route,opts){
   function refreshProviderOptions(keepValue){
     var cur=keepValue||ps.value;
     ps.innerHTML="";
-    var list=(catalog||[]).filter(function(e){return providerSupportsTask(e,ts.value) && !(routeMode==="group" && e.dialect==="anthropic");});
+    var list=(catalog||[]).filter(function(e){return providerSupportsTask(e,ts.value) && !(routeMode==="group" && (e.dialect==="anthropic" || e.dialect==="opencode_free"));});
     if(!list.length){ list=[{key:"custom-llm",label:"Custom LLM",base_url:"",dialect:"openai",key_env:"",key_set:false,enabled:true}]; }
     list.forEach(function(e){ var o=el("option",null,e.enabled===false ? e.label+" (coming soon)" : e.label); o.value=e.key; if(e.enabled===false) o.disabled=true; ps.appendChild(o); });
     if(cur && list.some(function(e){return e.key===cur && e.enabled!==false;})) ps.value=cur;
@@ -2575,6 +2576,11 @@ function openRouteModal(route,opts){
       var op=(oauthSpec(e.key)||{}).protocol||(e.key==="claude-code"?"anthropic_messages":(e.key==="codex"?"codex_responses":"openai_responses"));
       return { dialect:e.dialect, auth:oa, protocol:op };
     }
+    if((e.key||"").toLowerCase()==="opencode-free"){
+      // Free tier: no credential; the router adds the public bearer + opencode identity headers.
+      // dialect opencode_free also marks the backend so "Load models" sends those headers.
+      return { dialect:"opencode_free", auth:"opencode_free", protocol:"openai_chat" };
+    }
     var local = isLocalUrl(url.value.trim());
     var noAuthCustom = ((e.key||"").toLowerCase()==="custom-llm" || (e.key||"").toLowerCase()==="custom") && !pk.value.trim();
     var auth=((local || noAuthCustom) && !pk.value.trim())?"none":"bearer";
@@ -2627,7 +2633,7 @@ function openRouteModal(route,opts){
     var da=dialAuth(); var e=catEntry(ps.value); var sug=suggestedModels(e,ts.value);
     if(sug.length){ pickModelModal(sug, applyPickedModel); return; }
     if(!url.value.trim()){ toast("Enter a Base URL first","err"); return; }
-    if(da.auth!=="none" && !pk.value.trim() && !catEntry(ps.value).key_set && !catEntry(ps.value).oauth){ toast("Enter an API key, or choose Custom LLM for a no-auth local endpoint","err"); return; }
+    if(da.auth!=="none" && da.auth!=="opencode_free" && !pk.value.trim() && !catEntry(ps.value).key_set && !catEntry(ps.value).oauth){ toast("Enter an API key, or choose Custom LLM for a no-auth local endpoint","err"); return; }
     var kp=keyPayloadOrFail();
     if(!kp) return;
     loadBtn.disabled=true; loadBtn.textContent="Loading…";
