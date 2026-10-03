@@ -704,9 +704,12 @@ fn normalize_backend_format(value: &str) -> Result<&'static str, ApiError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "openai" | "open_ai" => Ok("openai"),
         "anthropic" => Ok("anthropic"),
+        // Marker for the OpenCode Zen free tier, not a third wire dialect: config load maps it
+        // to the OpenAI dialect, and admin probes use it to send the free-tier client headers.
+        "opencode_free" | "opencode-free" => Ok("opencode_free"),
         _ => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "format must be openai or anthropic",
+            "format must be openai, anthropic or opencode_free",
         )),
     }
 }
@@ -1302,6 +1305,15 @@ async fn fetch_backend_models(
                     .header("anthropic-version", "2023-06-01");
             }
         }
+        // No credential exists; the catalog still answers only with the free-tier identity
+        // headers (pinned opencode User-Agent included) applied by the same code the proxy uses.
+        "opencode_free" => {
+            let plan = provider_auth::resolve(provider_auth::OPENCODE_FREE_AUTH_MODE, false, None);
+            let mut headers = reqwest::header::HeaderMap::new();
+            provider_auth::apply_headers(&mut headers, &plan, "")
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+            req = req.headers(headers);
+        }
         _ => unreachable!(),
     }
     let resp = req
@@ -1347,7 +1359,8 @@ async fn preview_models(
         payload.provider_key_ref.as_deref(),
     )?;
     // Blank key cho auth bắt buộc -> chặn ngay (không gọi provider rồi dính 401/502).
-    if auth_mode != "none" && key.is_empty() {
+    // `opencode_free` is credential-less like `none`: it carries its own identity headers.
+    if !provider_auth::auth_mode_needs_no_key(&auth_mode) && key.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "provider key is required for this auth mode",
@@ -1359,7 +1372,8 @@ async fn preview_models(
         .client
         .get(url)
         .timeout(Duration::from_secs(15));
-    if auth_mode != "none" && !key.is_empty() {
+    let free_identity_headers = provider_auth::is_opencode_free_mode(&auth_mode);
+    if !key.is_empty() || free_identity_headers {
         // Same plan the proxy will use, so a green preview means the real route works.
         let plan = provider_auth::resolve(
             &auth_mode,
@@ -1576,6 +1590,24 @@ fn provider_catalog_from_env() -> Vec<ProviderCatalogEntry> {
             oauth_risk_note: None,
         });
     }
+    // OpenCode Zen free tier: credential-less chat provider. The `opencode_free` dialect marks
+    // the backend so admin probes (Load models) send the free-tier identity headers; the route
+    // wizard pairs it with auth_mode `opencode_free`.
+    if !entries.iter().any(|e| e.key == "opencode-free") {
+        entries.push(ProviderCatalogEntry {
+            key: "opencode-free".to_string(),
+            label: "OpenCode Free".to_string(),
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            dialect: "opencode_free".to_string(),
+            key_env: String::new(),
+            key_set: false,
+            enabled: true,
+            oauth: false,
+            oauth_flow: None,
+            oauth_auth_mode: None,
+            oauth_risk_note: None,
+        });
+    }
     // OAuth providers are appended from the spec table rather than from PROVIDER_CATALOG, so
     // an operator upgrading the binary gets them without also editing their .env. The table is
     // the single source of truth; a catalog entry with the same key simply wins, so an operator
@@ -1683,13 +1715,15 @@ struct TestConnectionResponse {
 ///
 /// Goes through `provider_auth::apply_headers` — the same function the proxy uses — so a green
 /// "Test connection" proves the real upstream request carries an identical credential and the
-/// identical credential-scoped provider headers (`anthropic-beta`, `chatgpt-account-id`).
+/// identical credential-scoped provider headers (`anthropic-beta`, `chatgpt-account-id`). The
+/// OpenCode free mode has no credential: it skips the empty-key shortcut so its fixed identity
+/// headers still reach the probe.
 fn add_provider_auth(
     req: reqwest::RequestBuilder,
     plan: &provider_auth::AuthPlan<'_>,
     key: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
-    if key.is_empty() {
+    if key.is_empty() && plan.mode != provider_auth::HeaderMode::OpenCodeFree {
         return Ok(req);
     }
     let mut headers = reqwest::header::HeaderMap::new();
@@ -1739,6 +1773,10 @@ async fn test_chat_completion(
     };
     let body = if anthropic {
         serde_json::json!({"model": model, "max_tokens": 1, "messages": [{"role":"user","content":"ping"}]})
+    } else if plan.mode == provider_auth::HeaderMode::OpenCodeFree {
+        // The free tier 403s non-streaming bodies, so the probe must stream too. A 200 then
+        // arrives as SSE; the JSON parse yields None and the probe still reports success.
+        serde_json::json!({"model": model, "max_tokens": 1, "stream": true, "messages": [{"role":"user","content":"ping"}]})
     } else {
         serde_json::json!({"model": model, "max_tokens": 1, "stream": false, "messages": [{"role":"user","content":"ping"}]})
     };
@@ -2013,7 +2051,8 @@ async fn test_connection(
         payload.provider_key.as_deref(),
         payload.provider_key_ref.as_deref(),
     )?;
-    if auth_mode != "none" && key.is_empty() {
+    // The OpenCode free tier needs no key (it carries its own identity headers), like `none`.
+    if !provider_auth::auth_mode_needs_no_key(&auth_mode) && key.is_empty() {
         return Ok(Json(TestConnectionResponse {
             ok: false,
             latency_ms: 0,
@@ -2311,6 +2350,14 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
         .filter(|s| !s.is_empty())
     {
         Some(key) => {
+            if provider_auth::is_opencode_free_mode(&auth_mode) {
+                // The free tier has no credential slot: a pasted key would be silently ignored
+                // by the header plan, so reject it instead of storing a secret that does nothing.
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "provider key must be empty when auth_mode is opencode_free",
+                ));
+            }
             if auth_mode == "none" {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
@@ -2420,6 +2467,13 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                     .filter(|s| !s.is_empty())
                 {
                     Some(key) => {
+                        if provider_auth::is_opencode_free_mode(&endpoint_auth) {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "endpoint provider key must be empty when auth_mode is \
+                                 opencode_free",
+                            ));
+                        }
                         if endpoint_auth == "none" {
                             return Err(ApiError::new(
                                 StatusCode::BAD_REQUEST,
@@ -4081,7 +4135,43 @@ mod tests {
         assert_eq!(normalize_backend_format("openai").unwrap(), "openai");
         assert_eq!(normalize_backend_format("Open_AI").unwrap(), "openai");
         assert_eq!(normalize_backend_format("anthropic").unwrap(), "anthropic");
+        assert_eq!(
+            normalize_backend_format("opencode_free").unwrap(),
+            "opencode_free"
+        );
+        assert_eq!(
+            normalize_backend_format(" OpenCode-Free ").unwrap(),
+            "opencode_free"
+        );
         assert!(normalize_backend_format("gemini").is_err());
+    }
+
+    #[test]
+    fn opencode_free_backend_probe_headers_carry_the_free_identity() {
+        // The Load-models probe must send the exact header set the proxy sends, or the
+        // OpenCode catalog rejects the request (it requires the pinned opencode User-Agent).
+        let plan = provider_auth::resolve(provider_auth::OPENCODE_FREE_AUTH_MODE, false, None);
+        assert_eq!(plan.mode, provider_auth::HeaderMode::OpenCodeFree);
+        let mut headers = reqwest::header::HeaderMap::new();
+        provider_auth::apply_headers(&mut headers, &plan, "").unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer public");
+        assert_eq!(
+            headers.get("user-agent").unwrap(),
+            provider_auth::OPENCODE_FREE_USER_AGENT
+        );
+        assert!(headers.get("x-opencode-session").is_some());
+    }
+
+    #[test]
+    fn opencode_free_is_in_the_provider_catalog_for_the_portal() {
+        let catalog = provider_catalog_from_env();
+        let entry = catalog
+            .iter()
+            .find(|e| e.key == "opencode-free")
+            .expect("opencode-free catalog entry");
+        assert_eq!(entry.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(entry.dialect, "opencode_free");
+        assert!(!entry.oauth && entry.key_env.is_empty());
     }
 
     #[test]
