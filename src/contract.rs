@@ -158,6 +158,15 @@ pub struct Backend {
     pub max_inflight: u32, // 0 = không giới hạn
     pub format: BackendFormat,
     pub enabled: bool,
+    /// Registry slug (vd "deepseek") khi backend được tạo từ `src/provider_registry`.
+    /// None = backend thường, mọi giá trị do caller cung cấp (backward-compat).
+    pub provider_type: Option<String>,
+    /// Protocol registry-derived khi provider_type set (ProviderProtocol::as_str()).
+    /// Chuỗi rỗng khi provider_type None — khi đó protocol của route là authoritative.
+    pub protocol: String,
+    /// Auth mode registry-derived khi provider_type set (provider_auth::AUTH_MODES).
+    /// Chuỗi rỗng khi provider_type None.
+    pub auth_mode: String,
 }
 
 impl std::fmt::Debug for Backend {
@@ -172,6 +181,9 @@ impl std::fmt::Debug for Backend {
             .field("max_inflight", &self.max_inflight)
             .field("format", &self.format)
             .field("enabled", &self.enabled)
+            .field("provider_type", &self.provider_type)
+            .field("protocol", &self.protocol)
+            .field("auth_mode", &self.auth_mode)
             .finish()
     }
 }

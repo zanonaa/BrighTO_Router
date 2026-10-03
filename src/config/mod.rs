@@ -13,6 +13,7 @@ use crate::contract::{
 };
 use crate::oauth;
 use crate::provider_auth::is_oauth_mode;
+use crate::provider_registry;
 use crate::quota::QuotaKey;
 
 /// Route credential resolved once, at config-load time: the header-carrying secret plus any
@@ -126,7 +127,8 @@ impl DbConfigLoader {
     async fn load_backends(&self) -> Result<Vec<Backend>> {
         let rows = fetch_rows(
             &self.pool,
-            "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled FROM backends",
+            "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled, \
+             provider_type FROM backends",
         )
         .await
         .context("load backends")?;
@@ -135,12 +137,42 @@ impl DbConfigLoader {
         for row in rows {
             let id = g_i64(&row, 0)?;
             let name = g_str(&row, 1)?;
-            let base_url = g_str(&row, 2)?;
+            let stored_base_url = g_str(&row, 2)?;
             let api_key_ref = g_str(&row, 3)?;
             let weight = g_i64(&row, 4)?;
             let max_inflight = g_i64(&row, 5)?;
-            let format = g_str(&row, 6)?;
+            let stored_format = g_str(&row, 6)?;
             let enabled = g_bool(&row, 7)?;
+            let provider_type: Option<String> = row.try_get::<Option<String>, _>(8)?;
+            // Provider registry: khi provider_type set, base_url/format và route defaults
+            // (protocol/auth_mode) được suy ra từ bảng registry — giá trị lưu trong DB có thể
+            // rỗng/lỗi thời. Unknown slug (vd binary cũ hơn slug mới) fallback về giá trị
+            // stored để config reload không chết vì một row mới hơn binary.
+            let entry = provider_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(provider_registry::lookup);
+            let (base_url, format, protocol, auth_mode) = match entry {
+                Some(e) => (
+                    e.resolve_base_url(&stored_base_url),
+                    e.backend_format().to_string(),
+                    e.protocol.to_string(),
+                    e.auth_mode.to_string(),
+                ),
+                None => {
+                    if provider_type
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        eprintln!(
+                            "WARN config: unknown provider_type {} for backend {id}; using stored base_url/format",
+                            provider_type.as_deref().unwrap_or_default()
+                        );
+                    }
+                    (stored_base_url, stored_format, String::new(), String::new())
+                }
+            };
             let backend_format = match format.as_str() {
                 "openai" => BackendFormat::OpenAi,
                 "anthropic" => BackendFormat::Anthropic,
@@ -149,10 +181,24 @@ impl DbConfigLoader {
                 "opencode_free" => BackendFormat::OpenAi,
                 other => return Err(anyhow!("unknown backend format '{other}' for backend {id}")),
             };
-            let api_key = resolve_backend_key(&api_key_ref);
-            if api_key.is_none() {
-                eprintln!("WARN config: cannot resolve api_key_ref {api_key_ref} for backend {id}");
-            }
+            // Backend-level credential: OAuth references (oauth:codex:...) resolve per-route
+            // qua token store — backend row không có key tĩnh, đỡ warn nhầm lẫn.
+            let oauth_backend = entry.map(|e| is_oauth_mode(e.auth_mode)).unwrap_or(false)
+                || api_key_ref
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("oauth:");
+            let api_key = if oauth_backend {
+                None
+            } else {
+                let k = resolve_backend_key(&api_key_ref);
+                if k.is_none() {
+                    eprintln!(
+                        "WARN config: cannot resolve api_key_ref {api_key_ref} for backend {id}"
+                    );
+                }
+                k
+            };
             out.push(Backend {
                 id,
                 name,
@@ -163,6 +209,9 @@ impl DbConfigLoader {
                 max_inflight: u32::try_from(max_inflight).unwrap_or(0),
                 format: backend_format,
                 enabled,
+                provider_type: entry.map(|e| e.slug.to_string()).or(provider_type),
+                protocol,
+                auth_mode,
             });
         }
         Ok(out)
@@ -521,6 +570,102 @@ mod tests {
         assert!(snap.routes.is_empty());
         assert!(snap.teams.is_empty());
         assert!(snap.keys_by_hash.is_empty());
+    }
+
+    async fn insert_backend(
+        pool: &PgPool,
+        name: &str,
+        base_url: &str,
+        format: &str,
+        provider_type: Option<&str>,
+    ) -> i64 {
+        let row = sqlx::query(
+            "INSERT INTO backends (name, base_url, api_key_ref, format, provider_type) \
+             VALUES ($1, $2, 'env:SOME_KEY', $3, $4) RETURNING id",
+        )
+        .bind(name)
+        .bind(base_url)
+        .bind(format)
+        .bind(provider_type)
+        .fetch_one(pool)
+        .await
+        .expect("insert backend");
+        row.try_get::<i64, _>(0).expect("backend id")
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn provider_type_backend_derives_url_format_and_route_defaults(pool: PgPool) {
+        // Stored columns may be empty/stale when provider_type is set; the registry is the
+        // source of truth at load time.
+        let id = insert_backend(&pool, "codex", "", "openai", Some("codex-oauth")).await;
+        let loader = DbConfigLoader::new(pool, 5);
+        let snap = loader.load_snapshot().await.expect("load");
+        let b = snap.backends.get(&id).expect("backend present");
+        assert_eq!(b.provider_type.as_deref(), Some("codex-oauth"));
+        assert_eq!(b.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(b.format, BackendFormat::OpenAi);
+        assert_eq!(b.protocol, "codex_responses");
+        assert_eq!(b.auth_mode, "chatgpt_oauth");
+        // OAuth ref: no static key at backend level (the token resolves per route).
+        assert_eq!(b.api_key, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn provider_type_with_fixed_base_url_overrides_a_stale_stored_url(pool: PgPool) {
+        let id = insert_backend(
+            &pool,
+            "deepseek",
+            "https://wrong.example.com",
+            "openai",
+            Some("deepseek"),
+        )
+        .await;
+        let loader = DbConfigLoader::new(pool, 5);
+        let snap = loader.load_snapshot().await.expect("load");
+        let b = snap.backends.get(&id).expect("backend present");
+        assert_eq!(b.base_url, "https://api.deepseek.com");
+        assert_eq!(b.protocol, "openai_chat");
+        assert_eq!(b.auth_mode, "bearer");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backend_without_provider_type_keeps_stored_values(pool: PgPool) {
+        let id = insert_backend(
+            &pool,
+            "legacy",
+            "https://api.example.com",
+            "anthropic",
+            None,
+        )
+        .await;
+        let loader = DbConfigLoader::new(pool, 5);
+        let snap = loader.load_snapshot().await.expect("load");
+        let b = snap.backends.get(&id).expect("backend present");
+        assert_eq!(b.provider_type, None);
+        assert_eq!(b.base_url, "https://api.example.com");
+        assert_eq!(b.format, BackendFormat::Anthropic);
+        assert_eq!(b.protocol, "");
+        assert_eq!(b.auth_mode, "");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unknown_provider_type_falls_back_to_stored_values_without_failing_load(pool: PgPool) {
+        // A slug this binary does not know (row written by a newer binary, or a typo via SQL)
+        // must not break config reload for every other row.
+        let id = insert_backend(
+            &pool,
+            "future",
+            "https://future.example.com/v1",
+            "openai",
+            Some("opencode-free"),
+        )
+        .await;
+        let loader = DbConfigLoader::new(pool, 5);
+        let snap = loader.load_snapshot().await.expect("load still succeeds");
+        let b = snap.backends.get(&id).expect("backend present");
+        assert_eq!(b.base_url, "https://future.example.com/v1");
+        assert_eq!(b.protocol, "");
+        assert_eq!(b.auth_mode, "");
     }
 
     #[test]

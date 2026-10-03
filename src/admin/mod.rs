@@ -33,6 +33,7 @@ use crate::contract::{
 };
 use crate::oauth;
 use crate::provider_auth::{self, parse_auth_mode};
+use crate::provider_registry::{self, ProviderType};
 
 /// Phân biệt "field bị bỏ qua" (None) với "field = null" (Some(None)) cho Option<Option<T>>.
 /// serde mặc định map null -> None (giống bỏ qua); helper này giữ null -> Some(None).
@@ -311,6 +312,7 @@ pub fn router(runtime: Arc<AppState>) -> Router {
         .route("/routes", get(list_routes).post(upsert_route))
         .route("/routes/preview-models", post(preview_models))
         .route("/provider-catalog", get(list_provider_catalog))
+        .route("/providers", get(list_providers))
         .route("/test-connection", post(test_connection))
         .merge(oauth_api::routes())
         .merge(quota_api::routes())
@@ -424,6 +426,8 @@ struct BackendResponse {
     max_inflight: i64,
     format: String,
     enabled: bool,
+    /// Registry slug khi backend được tạo từ provider registry (null = backend thường).
+    provider_type: Option<String>,
     /// Số model route ĐANG enabled tham chiếu provider này.
     active_route_count: i64,
     /// Số dòng usage_ledger ghi cho provider này.
@@ -445,16 +449,167 @@ struct PatchBackend {
     enabled: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CreateBackend {
     name: String,
-    base_url: String,
-    api_key_ref: String,
-    format: String,
+    /// Legacy path (no provider_type): required, exactly as before.
+    /// With provider_type: required only for entries without a fixed base URL (custom-openai).
+    #[serde(default)]
+    base_url: Option<String>,
+    /// Credential reference (env:NAME | file:/path). Legacy path: required non-empty.
+    #[serde(default)]
+    api_key_ref: Option<String>,
+    /// Legacy path (no provider_type): required ("openai" | "anthropic"). Derived from the
+    /// registry when provider_type is set.
+    #[serde(default)]
+    format: Option<String>,
+    /// Registry slug (see GET /admin/providers). When present, base_url/format and the
+    /// route-facing protocol/auth_mode defaults are derived from the registry.
+    #[serde(default)]
+    provider_type: Option<String>,
+    /// Plaintext provider API key (write-only). Stored as a secrets-dir file reference,
+    /// never in the DB — same mechanism as PUT /admin/backends/{id}/key.
+    #[serde(default)]
+    key: Option<String>,
     weight: Option<u32>,
     max_inflight: Option<u32>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+}
+
+/// `POST /admin/backends` payload sau khi resolve: đúng các giá trị sẽ ghi vào DB (hoặc vào
+/// file secrets). Pure function để unit-test đường derivation mà không cần DB/pool.
+#[derive(Debug)]
+struct ResolvedBackendCreate {
+    name: String,
+    /// Entry registry khi payload có provider_type hợp lệ (None = legacy payload).
+    provider_type: Option<&'static ProviderType>,
+    base_url: String,
+    format: &'static str,
+    /// Reference lưu trong DB; rỗng = credential đến từ `key` (ghi file sau INSERT) hoặc
+    /// backend không cần credential.
+    api_key_ref: String,
+    /// Plaintext key cần ghi ra file secrets sau khi INSERT (không bao giờ lưu DB).
+    plaintext_key: Option<String>,
+    weight: u32,
+    max_inflight: u32,
+    enabled: bool,
+}
+
+/// Resolve payload create-backend thành các cột sẽ lưu.
+///
+/// Hai đường:
+/// * Không có `provider_type` (legacy): mọi giá trị caller cung cấp, validate y hệt cũ.
+/// * Có `provider_type`: registry suy ra base_url/format; entry có base_url cố định thì
+///   override caller (tránh URL sai trỏ provider quen đi nơi khác), entry custom thì bắt
+///   buộc caller gửi base_url.
+fn resolve_backend_create(payload: CreateBackend) -> Result<ResolvedBackendCreate, ApiError> {
+    let name = non_empty_trimmed(payload.name, "name")?;
+    let plaintext_key = payload
+        .key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let api_key_ref = payload
+        .api_key_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    let weight = payload.weight.unwrap_or(1).max(1);
+    let max_inflight = payload.max_inflight.unwrap_or(0);
+
+    let provider_slug = payload
+        .provider_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (provider_type, base_url, format) = match provider_slug {
+        None => {
+            // Legacy payload: hành vi giữ nguyên 100% — base_url/api_key_ref/format bắt buộc.
+            let base_url = match payload.base_url {
+                Some(v) => non_empty_trimmed(v, "base_url")?,
+                None => {
+                    return Err(ApiError::bad_request("base_url must not be empty"));
+                }
+            };
+            let format = match payload.format {
+                Some(v) => normalize_backend_format(&v)?,
+                None => {
+                    return Err(ApiError::bad_request("format must be openai or anthropic"));
+                }
+            };
+            let api_key_ref = api_key_ref
+                .ok_or_else(|| ApiError::bad_request("api_key_ref must not be empty"))?;
+            return Ok(ResolvedBackendCreate {
+                name,
+                provider_type: None,
+                base_url,
+                format,
+                api_key_ref,
+                plaintext_key,
+                weight,
+                max_inflight,
+                enabled: payload.enabled,
+            });
+        }
+        Some(slug) => {
+            let entry = provider_registry::lookup(slug).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown provider_type '{slug}'; see GET /admin/providers"
+                ))
+            })?;
+            // Entries với base_url cố định: registry thắng caller base_url. Entry custom
+            // (base_url None): caller phải gửi base_url.
+            let base_url = match entry.base_url {
+                Some(fixed) => fixed.to_string(),
+                None => match payload.base_url {
+                    Some(v) => non_empty_trimmed(v, "base_url")?,
+                    None => {
+                        return Err(ApiError::bad_request(format!(
+                            "provider_type '{slug}' requires base_url"
+                        )));
+                    }
+                },
+            };
+            if crate::provider_auth::is_oauth_mode(entry.auth_mode) {
+                // OAuth credential là connected account (oauth:<provider>:<label>), không bao
+                // giờ là key dán tay — chặn ngay thay vì lưu thứ không chạy được.
+                if plaintext_key.is_some() {
+                    return Err(ApiError::bad_request(format!(
+                        "provider_type '{slug}' uses a connected OAuth account; pass \
+                         api_key_ref oauth:<provider>:<label> instead of a pasted key"
+                    )));
+                }
+            } else if entry.requires_credential && api_key_ref.is_none() && plaintext_key.is_none()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "provider_type '{slug}' requires an API key (key or api_key_ref)"
+                )));
+            }
+            (Some(entry), base_url, entry.backend_format())
+        }
+    };
+
+    // provider_type path: api_key_ref tùy chọn; key (plaintext) ưu tiên như route flow.
+    let api_key_ref = match (&plaintext_key, &api_key_ref) {
+        (Some(_), _) => String::new(), // ref sẽ là file:... sau khi ghi key
+        (None, Some(r)) => r.clone(),
+        (None, None) => String::new(),
+    };
+
+    Ok(ResolvedBackendCreate {
+        name,
+        provider_type,
+        base_url,
+        format,
+        api_key_ref,
+        plaintext_key,
+        weight,
+        max_inflight,
+        enabled: payload.enabled,
+    })
 }
 
 #[derive(Serialize)]
@@ -935,40 +1090,55 @@ async fn create_backend(
     Json(payload): Json<CreateBackend>,
 ) -> Result<Json<BackendResponse>, ApiError> {
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
-    let name = non_empty_trimmed(payload.name, "name")?;
-    let base_url = non_empty_trimmed(payload.base_url, "base_url")?;
-    let api_key_ref = non_empty_trimmed(payload.api_key_ref, "api_key_ref")?;
-    let format = normalize_backend_format(&payload.format)?;
-    let weight = payload.weight.unwrap_or(1).max(1);
-    let max_inflight = payload.max_inflight.unwrap_or(0);
+    let resolved = resolve_backend_create(payload)?;
     let pool = state.pool().await?;
+    let provider_slug: Option<&str> = resolved.provider_type.map(|p| p.slug);
     let row = sqlx::query::<sqlx::Postgres>(
-        "INSERT INTO backends (name, base_url, api_key_ref, weight, max_inflight, format, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        "INSERT INTO backends (name, base_url, api_key_ref, weight, max_inflight, format, enabled, provider_type) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
-    .bind(&name)
-    .bind(&base_url)
-    .bind(&api_key_ref)
-    .bind(weight as i64)
-    .bind(max_inflight as i64)
-    .bind(format)
-    .bind(payload.enabled)
+    .bind(&resolved.name)
+    .bind(&resolved.base_url)
+    .bind(&resolved.api_key_ref)
+    .bind(resolved.weight as i64)
+    .bind(resolved.max_inflight as i64)
+    .bind(resolved.format)
+    .bind(resolved.enabled)
+    .bind(provider_slug)
     .fetch_one(pool)
     .await?;
     let id: i64 = row.try_get("id")?;
+    // Plaintext key: ghi file secrets (0600) rồi lưu ref — không bao giờ lưu plaintext vào DB,
+    // cùng cơ chế với PUT /admin/backends/{id}/key.
+    let mut api_key_ref = resolved.api_key_ref.clone();
+    if let Some(key) = resolved.plaintext_key.as_deref() {
+        let data_dir =
+            std::env::var("DATA_DIR").unwrap_or_else(|_| "/var/lib/brighto-router".to_string());
+        let path = std::path::Path::new(&data_dir)
+            .join("provider_keys")
+            .join(format!("{id}.key"));
+        write_provider_key_file(&path, key)?;
+        api_key_ref = format!("file:{}", path.display());
+        sqlx::query::<sqlx::Postgres>("UPDATE backends SET api_key_ref = $1 WHERE id = $2")
+            .bind(&api_key_ref)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
     state.reload_now().await?;
     Ok(Json(BackendResponse {
         id,
-        name,
-        base_url,
+        name: resolved.name,
+        base_url: resolved.base_url,
         key_resolved: resolve_backend_key(&api_key_ref)
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false),
         api_key_ref,
-        weight: weight as i64,
-        max_inflight: max_inflight as i64,
-        format: format.to_string(),
-        enabled: payload.enabled,
+        weight: resolved.weight as i64,
+        max_inflight: resolved.max_inflight as i64,
+        format: resolved.format.to_string(),
+        enabled: resolved.enabled,
+        provider_type: provider_slug.map(str::to_owned),
         active_route_count: 0,
         usage_count: 0,
         can_delete: true,
@@ -984,7 +1154,7 @@ async fn list_backends(
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
     let pool = state.pool().await?;
     let rows = sqlx::query::<sqlx::Postgres>(
-        "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled FROM backends ORDER BY id",
+        "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled, provider_type FROM backends ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -994,6 +1164,10 @@ async fn list_backends(
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let api_key_ref: String = row.try_get("api_key_ref")?;
+        let provider_type: Option<String> = row
+            .try_get::<Option<String>, _>("provider_type")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let active_names = lc.active_by_backend.get(&id).cloned().unwrap_or_default();
         let active_route_count = active_names.len() as i64;
         let usage_count = lc.usage_by_backend.get(&id).copied().unwrap_or(0);
@@ -1020,6 +1194,7 @@ async fn list_backends(
             max_inflight: row.try_get("max_inflight")?,
             format: row.try_get("format")?,
             enabled: row.try_get("enabled")?,
+            provider_type,
             active_route_count,
             usage_count,
             can_delete: delete_blockers.is_empty(),
@@ -1650,6 +1825,21 @@ async fn list_provider_catalog(
 ) -> Result<Json<Vec<ProviderCatalogEntry>>, ApiError> {
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
     Ok(Json(provider_catalog_from_env()))
+}
+
+// ===== Provider registry (compiled-in catalog of provider types) =====
+
+/// Catalog các provider type đã biết (src/provider_registry.rs) cho UI dropdown: mỗi entry
+/// nói backend của loại đó cần base_url/protocol/auth_mode gì, để caller chỉ gửi
+/// `provider_type + credential`. Khác `/provider-catalog` (preset Portal từ .env): bảng này
+/// là nguồn chân lý cho derivation lúc tạo backend + load config.
+async fn list_providers(
+    Extension(state): Extension<Arc<AdminState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<&'static [ProviderType]>, ApiError> {
+    check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
+    Ok(Json(provider_registry::list()))
 }
 
 // ===== Test connection =====
@@ -4144,6 +4334,232 @@ mod tests {
             "opencode_free"
         );
         assert!(normalize_backend_format("gemini").is_err());
+    }
+
+    // ===== POST /admin/backends payload -> row resolution =====
+
+    fn legacy_backend_payload() -> CreateBackend {
+        CreateBackend {
+            name: "legacy".into(),
+            base_url: Some("https://api.example.com".into()),
+            api_key_ref: Some("env:EXAMPLE_API_KEY".into()),
+            format: Some("openai".into()),
+            provider_type: None,
+            key: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn legacy_create_payload_resolves_exactly_as_before() {
+        let resolved = resolve_backend_create(legacy_backend_payload()).expect("legacy payload");
+        assert_eq!(resolved.provider_type, None);
+        assert_eq!(resolved.name, "legacy");
+        assert_eq!(resolved.base_url, "https://api.example.com");
+        assert_eq!(resolved.api_key_ref, "env:EXAMPLE_API_KEY");
+        assert_eq!(resolved.format, "openai");
+        assert_eq!(resolved.plaintext_key, None);
+        assert_eq!(resolved.weight, 1);
+        assert_eq!(resolved.max_inflight, 0);
+        assert!(resolved.enabled);
+    }
+
+    #[test]
+    fn legacy_create_payload_keeps_its_validation_errors() {
+        // Missing values that used to be required fields still fail with 400, not silently
+        // deriving anything.
+        let mut p = legacy_backend_payload();
+        p.base_url = None;
+        let err = resolve_backend_create(p).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("base_url"));
+
+        let mut p = legacy_backend_payload();
+        p.format = None;
+        assert_eq!(
+            resolve_backend_create(p).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut p = legacy_backend_payload();
+        p.api_key_ref = None;
+        let err = resolve_backend_create(p).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("api_key_ref"));
+    }
+
+    #[test]
+    fn provider_type_derives_base_url_format_and_defaults() {
+        let payload = CreateBackend {
+            name: "ds".into(),
+            provider_type: Some("deepseek".into()),
+            key: Some("sk-deepseek".into()),
+            ..legacy_backend_payload()
+        };
+        let resolved = resolve_backend_create(payload).expect("deepseek resolves");
+        assert_eq!(resolved.provider_type.map(|p| p.slug), Some("deepseek"));
+        assert_eq!(resolved.base_url, "https://api.deepseek.com");
+        assert_eq!(resolved.format, "openai");
+        // Plaintext key travels to the secrets file; the stored ref is filled after INSERT.
+        assert_eq!(resolved.plaintext_key.as_deref(), Some("sk-deepseek"));
+        assert_eq!(resolved.api_key_ref, "");
+    }
+
+    #[test]
+    fn fixed_base_url_entries_override_a_conflicting_caller_base_url() {
+        let mut payload = CreateBackend {
+            name: "zai".into(),
+            provider_type: Some("ZAI".into()), // case-insensitive slug
+            key: Some("sk-zai".into()),
+            ..legacy_backend_payload()
+        };
+        payload.base_url = Some("https://attacker.example.com".into());
+        payload.format = Some("anthropic".into()); // derived format wins too
+        let resolved = resolve_backend_create(payload).expect("zai resolves");
+        assert_eq!(resolved.base_url, "https://api.z.ai/api/paas/v4");
+        assert_eq!(resolved.format, "openai");
+    }
+
+    #[test]
+    fn unknown_provider_type_is_rejected_with_400() {
+        let payload = CreateBackend {
+            name: "x".into(),
+            provider_type: Some("definitely-not-a-provider".into()),
+            key: Some("sk-x".into()),
+            ..legacy_backend_payload()
+        };
+        let err = resolve_backend_create(payload).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("unknown provider_type"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn custom_openai_requires_a_caller_base_url() {
+        let mut payload = CreateBackend {
+            name: "local".into(),
+            provider_type: Some("custom-openai".into()),
+            base_url: None,
+            api_key_ref: None,
+            format: None,
+            key: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        };
+        let err = resolve_backend_create(payload.clone()).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("custom-openai") && err.message.contains("requires base_url"),
+            "got: {}",
+            err.message
+        );
+
+        payload.base_url = Some("http://127.0.0.1:8088/v1".into());
+        // No credential is fine: local no-auth endpoints are a supported custom-openai case.
+        let resolved = resolve_backend_create(payload).expect("custom resolves");
+        assert_eq!(resolved.base_url, "http://127.0.0.1:8088/v1");
+        assert_eq!(resolved.format, "openai");
+        assert_eq!(resolved.api_key_ref, "");
+        assert_eq!(resolved.plaintext_key, None);
+    }
+
+    #[test]
+    fn api_key_providers_without_any_credential_are_rejected() {
+        let payload = CreateBackend {
+            name: "dahl".into(),
+            provider_type: Some("dahl".into()),
+            key: None,
+            api_key_ref: None,
+            base_url: None,
+            format: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        };
+        let err = resolve_backend_create(payload).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("dahl"));
+        assert!(err.message.contains("API key"));
+    }
+
+    #[test]
+    fn provider_type_accepts_an_api_key_ref_instead_of_a_pasted_key() {
+        let payload = CreateBackend {
+            name: "zai".into(),
+            provider_type: Some("zai".into()),
+            api_key_ref: Some("env:ZAI_API_KEY".into()),
+            key: None,
+            base_url: None,
+            format: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        };
+        let resolved = resolve_backend_create(payload).expect("zai with ref");
+        assert_eq!(resolved.api_key_ref, "env:ZAI_API_KEY");
+        assert_eq!(resolved.plaintext_key, None);
+    }
+
+    #[test]
+    fn oauth_provider_type_rejects_a_pasted_key() {
+        let payload = CreateBackend {
+            name: "codex".into(),
+            provider_type: Some("codex-oauth".into()),
+            key: Some("sk-not-how-oauth-works".into()),
+            base_url: None,
+            api_key_ref: None,
+            format: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        };
+        let err = resolve_backend_create(payload).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("connected OAuth account"));
+    }
+
+    #[test]
+    fn oauth_provider_type_without_credential_resolves() {
+        // The connected account is attached later (oauth:<provider>:<label> ref), so creating
+        // the backend row itself needs no credential.
+        let payload = CreateBackend {
+            name: "grok".into(),
+            provider_type: Some("xai-grok-oauth".into()),
+            api_key_ref: Some("oauth:xai-oauth:default".into()),
+            key: None,
+            base_url: None,
+            format: None,
+            weight: None,
+            max_inflight: None,
+            enabled: true,
+        };
+        let resolved = resolve_backend_create(payload).expect("grok resolves");
+        assert_eq!(
+            resolved.provider_type.map(|p| p.protocol),
+            Some("openai_responses")
+        );
+        assert_eq!(resolved.base_url, "https://cli-chat-proxy.grok.com/v1");
+        assert_eq!(resolved.api_key_ref, "oauth:xai-oauth:default");
+    }
+
+    #[test]
+    fn providers_endpoint_lists_the_registry_entries() {
+        let entries = provider_registry::list();
+        assert!(entries.iter().any(|p| p.slug == "deepseek"));
+        assert!(entries.iter().any(|p| p.slug == "custom-openai"));
+        // Every listed entry must be resolvable as a create payload provider_type.
+        for entry in entries {
+            assert_eq!(
+                provider_registry::lookup(entry.slug).unwrap().slug,
+                entry.slug
+            );
+        }
     }
 
     #[test]

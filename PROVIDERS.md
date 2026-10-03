@@ -33,6 +33,40 @@ The catalog is configured by `PROVIDER_CATALOG` in `.env`. The default catalog i
 
 **OpenAI-compatible** means the backend accepts OpenAI-style routes such as `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`, or `/v1/models` depending on the selected task. Rerank providers are selected by task type because several providers use different request shapes.
 
+## Provider registry (provider types)
+
+Besides the `.env` catalog above, the binary ships a compiled-in **provider registry**: a table of known
+upstream provider types, each deriving `{base_url, protocol, auth_mode, notes}`. `GET /admin/providers`
+lists it (for UI dropdowns), and `POST /admin/backends` accepts a `provider_type` so a backend can be
+created with just a name, a type, and a credential:
+
+```json
+POST /admin/backends
+{ "name": "deepseek", "provider_type": "deepseek", "key": "sk-..." }
+```
+
+Registry entries in 1.1.x:
+
+| `provider_type` | Base URL | Protocol | `auth_mode` | Credential |
+|---|---|---|---|---|
+| `zai` | `https://api.z.ai/api/paas/v4` | `openai_chat` | `bearer` | API key |
+| `deepseek` | `https://api.deepseek.com` | `openai_chat` | `bearer` | API key |
+| `dahl` | `https://inference.dahl.global/v1` | `openai_chat` | `bearer` | API key |
+| `codex-oauth` | `https://chatgpt.com/backend-api/codex` | `codex_responses` | `chatgpt_oauth` | connected account (`oauth:codex:<label>`) |
+| `xai-grok-oauth` | `https://cli-chat-proxy.grok.com/v1` | `openai_responses` | `xai_oauth` | connected account (`oauth:xai-oauth:<label>`) |
+| `custom-openai` | caller-supplied (required) | `openai_chat` | `bearer` | API key optional (local no-auth endpoints) |
+
+Rules: an unknown `provider_type` is a 400; entries with a fixed base URL ignore any caller-supplied
+`base_url` (the registry wins); `custom-openai` requires one. A pasted `key` is written to the secrets
+directory (`file:` reference, mode 0600) exactly like **Providers → set key**; it is never stored in the
+database. OAuth types reject pasted keys — connect the account first
+(see [OAuth providers](#oauth-providers-subscription-accounts)).
+
+Existing payloads without `provider_type` keep working unchanged, and a `provider_type` backend still
+derives its `base_url`/format at config load, so stored columns may be empty or stale after a registry
+update. Rows whose `provider_type` this binary does not know (written by a newer release) fall back to
+their stored `base_url`/format instead of failing the config reload.
+
 ## OAuth providers (subscription accounts)
 
 Some subscriptions are usable through the router without a paid API key, by signing in with the
