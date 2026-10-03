@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::budget::RamBudgetStore;
 use crate::ledger::LedgerSink;
 use crate::metrics::Metrics;
+use crate::quota::{QuotaKey, QuotaStore};
 use crate::route::RamBackendPool;
 
 pub type KeyHash = [u8; 32]; // SHA-256 của API key plaintext
@@ -218,6 +219,10 @@ pub struct ModelEndpoint {
     /// OAuth account owning this credential (Codex `chatgpt_account_id`). Runtime-only,
     /// resolved at config-load time from the token file, never written to the ledger.
     pub oauth_account_id: Option<Arc<str>>,
+    /// Which account's quota this endpoint spends. `None` for API-key routes, which are observed
+    /// from response headers only. Resolved at config-load time so the proxy never parses a
+    /// credential reference on the request path.
+    pub quota_key: Option<QuotaKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +232,7 @@ pub struct EffectiveModelEndpoint {
     pub auth_mode: String,
     pub protocol: String,
     pub oauth_account_id: Option<Arc<str>>,
+    pub quota_key: Option<QuotaKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +260,8 @@ pub struct ModelRoute {
     pub provider_key: Option<String>,
     /// OAuth account owning this credential (Codex `chatgpt_account_id`). Runtime-only.
     pub oauth_account_id: Option<Arc<str>>,
+    /// Which account's quota this route spends. Runtime-only, `None` for API-key routes.
+    pub quota_key: Option<QuotaKey>,
     /// Model Group load-balancing policy. Existing routes default to least_loaded_weighted.
     pub routing_policy: RoutingPolicy,
     /// Per-backend endpoint overrides for true mixed-provider groups. Empty keeps legacy single-endpoint behavior.
@@ -279,6 +287,10 @@ impl ModelRoute {
                     .oauth_account_id
                     .clone()
                     .or_else(|| self.oauth_account_id.clone()),
+                quota_key: endpoint
+                    .quota_key
+                    .clone()
+                    .or_else(|| self.quota_key.clone()),
             };
         }
         EffectiveModelEndpoint {
@@ -287,6 +299,7 @@ impl ModelRoute {
             auth_mode: self.auth_mode.clone(),
             protocol: self.protocol.clone(),
             oauth_account_id: self.oauth_account_id.clone(),
+            quota_key: self.quota_key.clone(),
         }
     }
 
@@ -418,6 +431,10 @@ pub struct AppState {
     pub ledger: LedgerSink,
     pub metrics: Metrics,
     pub max_body_bytes: usize,
+    /// Quota readings observed from upstream responses. Written once per response that carries
+    /// quota headers and read only by the admin API; it holds no lock and performs no I/O on the
+    /// request path.
+    pub quota: Arc<QuotaStore>,
     /// Admin gọi notify_one() sau mutation -> poll task reload ngay (không chờ 5s).
     pub reload_notify: Arc<tokio::sync::Notify>,
     /// epoch ms lần cuối config reload THÀNH CÔNG / THẤT BẠI — cho /readyz (control-plane, không hot path).

@@ -24,6 +24,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod oauth_api;
+pub mod quota_api;
 
 use crate::auth;
 use crate::config::{DbConfigLoader, resolve_backend_key};
@@ -52,6 +53,10 @@ struct AdminState {
     allow_cidrs: Vec<String>,
     pool: Arc<tokio::sync::OnceCell<PgPool>>,
     runtime: Arc<AppState>,
+    /// Built once and shared, because it owns the per-credential min-interval gate and 429
+    /// cooldown. Rebuilding it per request would reset both and turn a Portal refresh into a
+    /// provider hammer.
+    quota_probe: Arc<tokio::sync::OnceCell<Arc<crate::quota::probe::QuotaProbe>>>,
 }
 
 impl AdminState {
@@ -74,8 +79,24 @@ impl AdminState {
             master_key,
             allow_cidrs,
             pool: Arc::new(Default::default()),
+            quota_probe: Arc::new(Default::default()),
             runtime,
         }
+    }
+
+    /// The shared quota prober, created on first use.
+    async fn quota_probe(&self) -> Arc<crate::quota::probe::QuotaProbe> {
+        self.quota_probe
+            .get_or_try_init(|| async {
+                Ok::<_, std::convert::Infallible>(Arc::new(crate::quota::probe::QuotaProbe::new(
+                    self.runtime.client.clone(),
+                    Arc::new(crate::oauth::OAuthTokenStore::from_env()),
+                    self.runtime.quota.clone(),
+                )))
+            })
+            .await
+            .expect("quota probe init is infallible")
+            .clone()
     }
 
     async fn pool(&self) -> Result<&PgPool, ApiError> {
@@ -144,6 +165,10 @@ impl ApiError {
 
     fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
     }
 }
 
@@ -288,6 +313,7 @@ pub fn router(runtime: Arc<AppState>) -> Router {
         .route("/provider-catalog", get(list_provider_catalog))
         .route("/test-connection", post(test_connection))
         .merge(oauth_api::routes())
+        .merge(quota_api::routes())
         .route(
             "/routes/{model_name}",
             patch(patch_route).delete(delete_route),

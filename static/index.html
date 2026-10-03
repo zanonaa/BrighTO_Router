@@ -39,6 +39,24 @@ code{font-family:var(--mono);background:rgba(30,41,59,.6);padding:2px 7px;border
 .oauth-user-code{font-size:1.05rem}
 .oauth-user-code b{font-family:var(--mono);letter-spacing:.04em}
 .oauth-ref-note{color:var(--text-dim)}
+/* Quota cards: one per connected account. A balance row never gets a bar — a credit count is an
+   amount, not a share, and drawing one is how "348 credits" becomes "348%". */
+.quota-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.quota-card{padding:14px;border:1px solid var(--border);border-radius:12px;background:var(--card);display:flex;flex-direction:column;gap:10px}
+.quota-card.stale{border-color:rgba(245,158,11,.45)}
+.quota-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.quota-card-head .stack-cell{min-width:0}
+.quota-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 12px;align-items:baseline}
+.quota-row-label{font-size:12.5px;color:var(--muted);min-width:0}
+.quota-row-label .derived{color:var(--faint);font-style:italic}
+.quota-row-value{font-size:12.5px;font-family:var(--mono);color:var(--text);text-align:right;white-space:nowrap}
+.quota-row.balance .quota-row-value{color:var(--cyan)}
+.quota-bar{height:5px;border-radius:99px;background:rgba(148,163,184,.18);overflow:hidden;grid-column:1 / -1}
+.quota-bar>span{display:block;height:100%;border-radius:99px;background:var(--green)}
+.quota-bar.low>span{background:var(--amber)}
+.quota-bar.critical>span{background:var(--red)}
+.quota-reset{font-size:11.5px;color:var(--faint);grid-column:1 / -1;display:flex;justify-content:space-between;gap:8px}
+.quota-note{font-size:11.5px;color:var(--amber);border-top:1px dashed var(--border);padding-top:8px}
 .oauth-account-table td{vertical-align:top}
 
 /* ---------- Login ---------- */
@@ -914,6 +932,7 @@ async function refresh(){
       keys=await api("/admin/keys","GET");
       try{ catalog=await api("/admin/provider-catalog","GET"); }catch(e){ catalog=[]; }
       await refreshOAuth();
+      await refreshQuota(false);
     }
     var cur=document.querySelector(".nav.active");
     if(cur) render(cur.dataset.view); else go("dashboard");
@@ -1317,6 +1336,8 @@ function renderProviders(c){
   // Accounts sit below the endpoint table: the endpoint is the reusable piece, and an account is
   // what a route points at.
   c.appendChild(renderOAuthPanel());
+  // Allowance sits under the accounts it describes.
+  c.appendChild(renderQuotaPanel());
 }
 
 function openRouteModalForConnection(b){ window.presetConnection=b; openRouteModal(null,{mode:"single"}); }
@@ -1448,6 +1469,157 @@ async function disconnectOAuthAccount(a){
     toast(left?("Disconnected — "+left+" route reference(s) still point at this credential and will fail."):"Account disconnected", left?"err":"");
     await refreshOAuth(); rerender();
   }catch(e){ toast("Disconnect failed: "+e.message,"err"); }
+}
+
+/* ===== Quota ===== */
+/* How much of each account's allowance is left. Two sources feed the same card:
+   - response headers, observed for free as traffic flows (any route, including API-key ones),
+   - an active probe, which needs the account's own credential so it only exists for OAuth routes.
+   The fraction is derived HERE from used/total. The API deliberately never sends a percentage: a
+   provider that reports a credit count in a "remaining" field would otherwise render as "348%". */
+var quotaData=null;
+async function refreshQuota(probe){
+  try{
+    quotaData=await api("/admin/quota"+(probe?"?probe=true":""),"GET");
+  }catch(e){ quotaData=null; }
+}
+/* Same derivation the server does, in the same order. null means unknown — which is a different
+   statement from zero, and must never collapse into it. */
+function quotaRemaining(w){
+  if(w.kind==="balance") return null;   /* an amount is not a share of anything */
+  if(w.unlimited) return 1;
+  if(!(w.total>0)) return null;         /* limit not reported */
+  return Math.max(0,Math.min(1,(w.total-w.used)/w.total));
+}
+function quotaLevel(w){
+  var r=quotaRemaining(w);
+  if(r===null) return "info";
+  if(r>0.70) return "ok";
+  if(r>=0.30) return "low";
+  return "critical";
+}
+/* Reset times are shown as a countdown, because "in 4h" is actionable and a raw timestamp is not.
+   "-" once it has passed: the reading is from a window that has already rolled over. */
+function quotaCountdown(resetAtMs){
+  if(!resetAtMs) return "-";
+  var d=resetAtMs-Date.now();
+  if(d<=0) return "-";
+  var h=Math.floor(d/3600000), m=Math.floor((d%3600000)/60000), s=Math.floor((d%60000)/1000);
+  if(h>0) return "resets in "+h+"h "+m+"m";
+  if(m>0) return "resets in "+m+"m "+s+"s";
+  return "resets in "+s+"s";
+}
+function quotaNumber(n){
+  return (Math.round(n*10)/10).toLocaleString();
+}
+function renderQuotaPanel(){
+  var p=el("div","panel");
+  var h=el("div","panel-head");
+  h.appendChild(el("h3",null,"Allowance"));
+  var acts=el("div","panel-head-actions");
+  var probe=el("button","btn sm","Probe now");
+  probe.title="Ask every connected provider for its current quota (rate-limited per account)";
+  probe.onclick=async function(){
+    probe.disabled=true; probe.textContent="Probing…";
+    await refreshQuota(true);
+    probe.disabled=false; probe.textContent="Probe now"; rerender();
+  };
+  acts.appendChild(probe);
+  h.appendChild(acts);
+  p.appendChild(h);
+  p.appendChild(el("p","hint","How much of each account's allowance is left. Readings appear as traffic flows (from quota headers on responses) and from an explicit probe. Display only — nothing here steers routing. API-key routes are header-only: there is no credential to probe with."));
+
+  var d=quotaData;
+  if(!d){ p.appendChild(emptyBox("Quota is unavailable.")); return p; }
+  if(d.idle || !(d.accounts||[]).length){
+    p.appendChild(emptyBox("No quota yet. Connect an OAuth account or route some traffic; headers are observed automatically."));
+    return p;
+  }
+
+  var g=el("div","quota-grid");
+  (d.accounts||[]).forEach(function(a){
+    g.appendChild(quotaCard(a));
+  });
+  p.appendChild(g);
+
+  (d.passive_only||[]).forEach(function(o){
+    var n=el("div","quota-note");
+    n.textContent=((oauthSpec(o.provider)||{}).label||o.provider)+" ("+(o.label||"?")+"): "+o.reason;
+    p.appendChild(n);
+  });
+  return p;
+}
+function quotaCard(a){
+  var stale=!!a.stale;
+  var c=el("div","quota-card"+(stale?" stale":""));
+
+  var head=el("div","quota-card-head");
+  var hs=el("div","stack-cell");
+  var spec=oauthSpec(a.provider);
+  hs.appendChild(el("div","cell-main compact-line",(spec&&spec.label)||a.provider));
+  hs.appendChild(el("div","cell-sub",a.label+(a.plan?" · "+a.plan:"")));
+  head.appendChild(hs);
+  if(stale){ var sp=pill("stale","warn"); sp.classList.add("compact"); head.appendChild(sp); }
+  else if(a.exhausted){ var ep=pill("exhausted","off"); ep.classList.add("compact"); head.appendChild(ep); }
+  c.appendChild(head);
+
+  (a.windows||[]).forEach(function(w){ c.appendChild(quotaRow(w)); });
+
+  if(!(a.windows||[]).length){
+    c.appendChild(el("div","cell-sub","No window reported yet."));
+  }
+  (a.notes||[]).forEach(function(n){
+    var el2=el("div","quota-note"); el2.textContent=n.message; c.appendChild(el2);
+  });
+  if(!(a.sources||[]).length){
+    c.appendChild(el("div","cell-sub","Nothing observed yet — route traffic or press Probe now."));
+  }
+  return c;
+}
+/* One row per window. A percentage-shaped window gets a bar; a balance does not; an unreported
+   limit gets neither and says so in words. */
+function quotaRow(w){
+  var row=el("div","quota-row"+(w.kind==="balance"?" balance":""));
+  var lab=el("div","quota-row-label");
+  lab.appendChild(document.createTextNode(w.label));
+  if(w.derived){
+    var tag=el("span","derived"," · estimated");
+    tag.title="Computed by the router from the weekly window. The provider does not report a monthly figure.";
+    lab.appendChild(tag);
+  }
+  row.appendChild(lab);
+
+  var remaining=quotaRemaining(w);
+  var val;
+  if(w.kind==="balance"){
+    val=quotaNumber(w.used)+" credits";
+  } else if(w.unlimited){
+    val="Unlimited";
+  } else if(remaining===null){
+    val=quotaNumber(w.used)+" used · no limit reported";
+  } else {
+    var pct=Math.round(remaining*100);
+    val=quotaNumber(w.used)+" / "+quotaNumber(w.total)+" · "+pct+"% left";
+  }
+  var v=el("div","quota-row-value",val);
+  if(remaining!==null && w.kind!=="balance"){
+    if(remaining<=0.30) v.style.color="var(--red)";
+    else if(remaining<0.70) v.style.color="var(--amber)";
+  }
+  row.appendChild(v);
+
+  if(w.kind!=="balance" && !w.unlimited && remaining!==null){
+    var level=quotaLevel(w);
+    var bar=el("div","quota-bar"+(level==="ok"?"":" "+level));
+    var fill=el("span"); fill.style.width=Math.round(remaining*100)+"%";
+    bar.appendChild(fill); row.appendChild(bar);
+  }
+
+  var foot=el("div","quota-reset");
+  foot.appendChild(el("span",null,w.source==="provider"?"probe":(w.source==="router_derived"?"derived":"response")));
+  foot.appendChild(el("span",null,quotaCountdown(w.reset_at_ms)));
+  row.appendChild(foot);
+  return row;
 }
 
 /* The connect modal. Which affordance appears is decided by the provider table, not guessed in

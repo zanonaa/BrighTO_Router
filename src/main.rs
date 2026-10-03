@@ -201,11 +201,17 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
     let oauth_store = Arc::new(brighto_router::oauth::OAuthTokenStore::from_env());
     let oauth_notify = reload_notify.clone();
     refresh::spawn_refresh_loop(
-        oauth_store,
+        oauth_store.clone(),
         client.clone(),
         Duration::from_secs(refresh::DEFAULT_REFRESH_INTERVAL_SECS),
         Arc::new(move || oauth_notify.notify_one()),
     );
+
+    // Quota readings observed from upstream responses. Started empty and filled by the proxy as
+    // traffic flows; the admin API reads it and active probes write to it. Nothing here polls —
+    // a router serving no traffic to an OAuth route has nothing to observe, and inventing a
+    // reading would be worse than showing none.
+    let quota_store = Arc::new(brighto_router::quota::QuotaStore::new());
 
     // Ledger: hot path -> LedgerSink; writer nền -> DB batch / file fallback.
     let (primary_tx, primary_rx) = mpsc::channel(8192);
@@ -243,6 +249,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         ledger,
         metrics,
         max_body_bytes,
+        quota: quota_store.clone(),
         reload_notify,
         config_ok_at,
         config_err_at,

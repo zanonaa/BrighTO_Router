@@ -13,6 +13,7 @@ use crate::contract::{
 };
 use crate::oauth;
 use crate::provider_auth::is_oauth_mode;
+use crate::quota::QuotaKey;
 
 /// Route credential resolved once, at config-load time: the header-carrying secret plus any
 /// per-credential OAuth metadata. Keeping the two together means one read of the token file per
@@ -20,6 +21,9 @@ use crate::provider_auth::is_oauth_mode;
 struct ResolvedCredential {
     key: Option<String>,
     oauth_account_id: Option<Arc<str>>,
+    /// Which account's quota this credential spends. Derived from the reference itself, so it is
+    /// correct for any OAuth provider without another lookup table.
+    quota_key: Option<QuotaKey>,
 }
 
 /// Resolve a route/endpoint credential reference.
@@ -32,6 +36,7 @@ fn resolve_credential(auth_mode: &str, reference: &str) -> ResolvedCredential {
         return ResolvedCredential {
             key: resolve_backend_key(reference),
             oauth_account_id: None,
+            quota_key: None,
         };
     }
     let store = oauth::OAuthTokenStore::from_env();
@@ -39,10 +44,11 @@ fn resolve_credential(auth_mode: &str, reference: &str) -> ResolvedCredential {
     ResolvedCredential {
         key,
         oauth_account_id: account_id.map(Arc::from),
+        quota_key: QuotaKey::from_credential_ref(reference),
     }
 }
 
-/// Resolve a route/endpoint credential into the two values the snapshot carries.
+/// Resolve a route/endpoint credential into the three values the snapshot carries.
 ///
 /// `auth_mode = none` means the provider needs no credential at all (local llama.cpp / vLLM), and
 /// a route with no `provider_key_ref` inherits its backend's key at forward time — both yield
@@ -50,16 +56,16 @@ fn resolve_credential(auth_mode: &str, reference: &str) -> ResolvedCredential {
 fn resolve_route_credential_pair(
     auth_mode: &str,
     reference: Option<&str>,
-) -> (Option<String>, Option<Arc<str>>) {
+) -> (Option<String>, Option<Arc<str>>, Option<QuotaKey>) {
     if auth_mode == "none" {
-        return (None, None);
+        return (None, None, None);
     }
     match reference {
         Some(reference) => {
             let c = resolve_credential(auth_mode, reference);
-            (c.key, c.oauth_account_id)
+            (c.key, c.oauth_account_id, c.quota_key)
         }
-        None => (None, None),
+        None => (None, None, None),
     }
 }
 
@@ -196,7 +202,7 @@ impl DbConfigLoader {
             // Resolve route-level credential (nếu có). Khi route không có credential riêng, để
             // provider_key = None; proxy sẽ dùng backend.api_key của backend được chọn tại thời điểm
             // forward (mỗi backend có key riêng, kể cả fallback/secondary).
-            let (provider_key, oauth_account_id) =
+            let (provider_key, oauth_account_id, quota_key) =
                 resolve_route_credential_pair(&auth_mode, provider_key_ref.as_deref());
             let endpoints = endpoint_overrides.remove(&model_name).unwrap_or_default();
             out.push(ModelRoute {
@@ -216,6 +222,7 @@ impl DbConfigLoader {
                 protocol,
                 provider_key,
                 oauth_account_id,
+                quota_key,
                 routing_policy,
                 endpoints,
             });
@@ -246,7 +253,7 @@ impl DbConfigLoader {
             let weight = g_i64(&row, 6)?.max(1);
             let max_inflight = g_i64(&row, 7)?.max(0);
             let enabled = g_bool(&row, 8)?;
-            let (provider_key, oauth_account_id) =
+            let (provider_key, oauth_account_id, quota_key) =
                 resolve_route_credential_pair(&auth_mode, provider_key_ref.as_deref());
             out.entry(model_name).or_default().insert(
                 backend_id,
@@ -261,6 +268,7 @@ impl DbConfigLoader {
                     enabled,
                     provider_key,
                     oauth_account_id,
+                    quota_key,
                 },
             );
         }

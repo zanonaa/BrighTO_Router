@@ -522,6 +522,83 @@ def full_playwright_spec(base_url: str, admin_key: str, mock_url: str) -> str:
           }}
         }}
 
+        async function auditQuotaUi(page) {{
+          /* The passive-observation path (response headers -> store -> payload) is proven by
+             tests/quota_smoke.rs against a real mock upstream, so this audit covers what only the
+             Portal can regress: the payload contract and the rendering rules that stop a credit
+             count from being displayed as a percentage. */
+          const quota = await adminFetch('/admin/quota');
+          for (const field of ['accounts', 'passive_only', 'idle']) {{
+            if (!(field in quota)) throw new Error('/admin/quota is missing ' + field);
+          }}
+
+          const raw = JSON.stringify(quota);
+          /* No precomputed percentage may ever ship. A provider that reports a credit count in a
+             "remaining"-shaped field would render as "348%" — this is the payload-level guard.
+             A plain substring check is stricter than a field-name regex and adds no escapes. */
+          if (raw.indexOf('"remaining') >= 0) {{
+            throw new Error('quota payload carries a provider-controlled remaining field');
+          }}
+          if (raw.indexOf('%') >= 0) throw new Error('quota payload carries a percentage');
+
+          const levels = ['ok', 'low', 'critical', 'unknown'];
+          const ids = ['five_hour', 'seven_day', 'seven_day_overage', 'on_demand', 'month',
+                       'derived_month', 'seven_day_model'];
+          for (const a of quota.accounts) {{
+            if (typeof a.stale !== 'boolean') throw new Error(a.label + ': stale is not a boolean');
+            if (typeof a.exhausted !== 'boolean') throw new Error(a.label + ': exhausted is not a boolean');
+            if (typeof a.active_probe_supported !== 'boolean') {{
+              throw new Error(a.label + ': active_probe_supported is not a boolean');
+            }}
+            for (const w of a.windows || []) {{
+              if (ids.indexOf(w.id) < 0) throw new Error('unknown window id ' + w.id);
+              if (levels.indexOf(w.level) < 0) throw new Error('unknown level ' + w.level);
+              if (typeof w.used !== 'number' || typeof w.total !== 'number') {{
+                throw new Error(w.id + ': used/total must be numbers');
+              }}
+              /* A count has no denominator, so it can never sit in a percentage band. */
+              if (w.kind === 'balance' && w.level !== 'unknown') {{
+                throw new Error(w.id + ': a balance window must read as unknown, got ' + w.level);
+              }}
+              if (w.kind === 'window' && w.total === 0 && w.level !== 'unknown') {{
+                throw new Error(w.id + ': no reported limit must read as unknown, got ' + w.level);
+              }}
+              if (w.id === 'derived_month' && !w.derived) {{
+                throw new Error('derived_month must be labelled derived');
+              }}
+              if (w.id !== 'derived_month' && w.derived) {{
+                throw new Error(w.id + ': only the router-computed window may be labelled derived');
+              }}
+              if (w.id === 'derived_month' && w.source !== 'router_derived') {{
+                throw new Error('derived_month has source ' + w.source);
+              }}
+            }}
+            /* An account with no windows at all is not an exhausted account. */
+            if (!(a.windows || []).length && a.exhausted) {{
+              throw new Error(a.label + ': nothing reported, yet flagged exhausted');
+            }}
+          }}
+
+          /* Probing an account that does not exist must be refused with a reason, not a 500. */
+          let refused = null;
+          try {{ await adminFetch('/admin/quota/codex/audit-never-connected/probe', 'POST'); }}
+          catch (e) {{ refused = String(e.message); }}
+          if (refused === null) throw new Error('probed an account that does not exist');
+          if (!/connected|credential|no such/i.test(refused)) {{
+            throw new Error('probe refusal did not explain itself: ' + refused);
+          }}
+
+          /* The panel must say why it is empty rather than render a blank card. */
+          await nav(page, 'providers', 'Providers');
+          await expect(page.locator('#content')).toContainText('Allowance');
+          await expect(page.locator('#content')).toContainText('Display only');
+          await expect(page.locator('#content')).toContainText('No quota yet');
+          /* Nothing has been observed, so no card may exist. */
+          if (await page.locator('.quota-card').count()) {{
+            throw new Error('quota card rendered with no observation at all');
+          }}
+        }}
+
         async function auditProviderKeyFilePath() {{
           const backends = await adminFetch('/admin/backends');
           const backend = backends.find(b => b.name === 'custom-llm') || backends[0];
@@ -610,6 +687,7 @@ def full_playwright_spec(base_url: str, admin_key: str, mock_url: str) -> str:
             await auditProviderEndpointUi(page);
             await auditProviderTaskChoices(page);
             await auditOAuthUi(page);
+            await auditQuotaUi(page);
             await auditRoutes(page);
             await auditTeamAndKeyUi(page);
             await auditProviderKeyFilePath();
