@@ -934,6 +934,9 @@ mod tests {
             max_inflight,
             format: BackendFormat::OpenAi,
             enabled,
+            provider_type: None,
+            protocol: String::new(),
+            auth_mode: String::new(),
         }
     }
 
