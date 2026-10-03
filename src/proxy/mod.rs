@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::budget::{BudgetReservation, ConcurrencyGuard};
 use crate::contract::{ApiKey, AppState, BackendFormat, ModelRoute, ProviderProtocol, UsageEvent};
+use crate::provider_auth::{AuthPlan, apply_headers, resolve as resolve_auth_plan};
 use crate::route::{AcquireError, BackendExclusions, BackendLease};
 
 /// Quick check trước khi parse — tránh parse cả body 1MB. memchr, không cấp phát.
@@ -237,8 +238,12 @@ fn must_drop_header(name: &str) -> bool {
     )
 }
 
-/// Build request tới backend: filter header, inject auth backend (key đã resolve lúc load),
+/// Build request tới backend: filter header, inject provider credential (đã resolve lúc load),
 /// thêm x-request-id. Dùng client pool dùng chung từ state.
+///
+/// `plan` là quyết định header đã resolve sẵn từ `auth_mode` + dialect của backend + account
+/// id OAuth. Ở đây chỉ match enum và chèn header tĩnh: không đọc disk, không đọc env, không
+/// cấp phát. Xem `provider_auth` để hiểu vì sao tách khỏi `BackendFormat`.
 #[allow(clippy::too_many_arguments)]
 fn build_reqwest_request(
     client: &reqwest::Client,
@@ -246,7 +251,7 @@ fn build_reqwest_request(
     url: &str,
     headers: &HeaderMap,
     body: reqwest::Body,
-    format: BackendFormat,
+    plan: &AuthPlan<'_>,
     auth_key: &str,
     request_id: &str,
 ) -> Result<reqwest::Request, String> {
@@ -258,28 +263,9 @@ fn build_reqwest_request(
         req_headers.insert(name.clone(), value.clone());
     }
 
-    // auth_key rỗng = provider không cần key (llama.cpp/vLLM/Ollama / auth_mode=none). Chỉ gắn auth khi có giá trị.
-    let key = auth_key;
-    match format {
-        BackendFormat::OpenAi => {
-            if !key.is_empty() {
-                let v = HeaderValue::from_str(&format!("Bearer {key}"))
-                    .map_err(|e| format!("invalid backend key: {e}"))?;
-                req_headers.insert(reqwest::header::AUTHORIZATION, v);
-            }
-        }
-        BackendFormat::Anthropic => {
-            if !key.is_empty() {
-                let v =
-                    HeaderValue::from_str(key).map_err(|e| format!("invalid backend key: {e}"))?;
-                req_headers.insert("x-api-key", v);
-                // Chỉ đặt default nếu client KHÔNG tự gửi anthropic-version (giữ nguyên version client pin).
-                if !req_headers.contains_key("anthropic-version") {
-                    req_headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-                }
-            }
-        }
-    }
+    // Credential + credential-scoped provider headers. Shared with the admin probe path so a
+    // successful "Test connection" proves the real request carries the same headers.
+    apply_headers(&mut req_headers, plan, auth_key)?;
 
     let rid = HeaderValue::from_str(request_id).map_err(|e| format!("invalid request id: {e}"))?;
     req_headers.insert("x-request-id", rid);
@@ -1198,13 +1184,18 @@ pub async fn proxy_forward(
                 .or(backend.api_key.as_deref())
                 .unwrap_or("")
         };
+        let plan = resolve_auth_plan(
+            &endpoint.auth_mode,
+            backend.format == BackendFormat::Anthropic,
+            endpoint.oauth_account_id.as_deref(),
+        );
         let built = build_reqwest_request(
             &state.client,
             &method,
             &url,
             &headers,
             request_body,
-            backend.format,
+            &plan,
             auth_key,
             &ctx.request_id,
         );
@@ -1433,7 +1424,7 @@ mod tests {
             "http://127.0.0.1:9000/v1/messages",
             &headers,
             reqwest::Body::from(Bytes::from("{}")),
-            BackendFormat::Anthropic,
+            &resolve_auth_plan("anthropic", true, None),
             "anthropic-backend-secret",
             "rid-1",
         )
@@ -1458,7 +1449,7 @@ mod tests {
             "http://127.0.0.1:9000/v1/messages",
             &headers,
             reqwest::Body::from(Bytes::from("{}")),
-            BackendFormat::Anthropic,
+            &resolve_auth_plan("anthropic", true, None),
             "anthropic-backend-secret",
             "rid-2",
         )
@@ -1484,7 +1475,7 @@ mod tests {
             "http://127.0.0.1:9000/v1/messages",
             &headers,
             reqwest::Body::from(Bytes::from("{}")),
-            BackendFormat::Anthropic,
+            &resolve_auth_plan("anthropic", true, None),
             "anthropic-backend-secret",
             "rid-encoding",
         )
@@ -1493,6 +1484,170 @@ mod tests {
         assert_eq!(
             req.headers().get(reqwest::header::ACCEPT_ENCODING).unwrap(),
             "identity"
+        );
+    }
+
+    #[test]
+    fn oauth_claude_request_carries_beta_and_uses_bearer_not_x_api_key() {
+        let client = reqwest::Client::new();
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/messages",
+            &HeaderMap::new(),
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("anthropic_oauth", true, None),
+            "oauth-access-token",
+            "rid-oauth-claude",
+        )
+        .unwrap();
+
+        let h = req.headers();
+        assert_eq!(
+            h.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer oauth-access-token"
+        );
+        assert!(
+            h.get("x-api-key").is_none(),
+            "Anthropic OAuth must not travel in x-api-key"
+        );
+        let beta = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(beta.contains("oauth-2025-04-20"), "beta was {beta}");
+        assert!(h.get("anthropic-version").is_some());
+    }
+
+    #[test]
+    fn oauth_client_beta_is_appended_not_replaced() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        // A client that explicitly opted out of interleaved thinking must stay opted out.
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("disable-interleaved-thinking-2025-05-14"),
+        );
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/messages",
+            &headers,
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("anthropic_oauth", true, None),
+            "oauth-access-token",
+            "rid-oauth-beta",
+        )
+        .unwrap();
+
+        let values: Vec<String> = req
+            .headers()
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            values
+                .iter()
+                .any(|v| v.contains("disable-interleaved-thinking")),
+            "client beta was dropped: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("oauth-2025-04-20")),
+            "oauth beta was not added: {values:?}"
+        );
+    }
+
+    #[test]
+    fn api_key_route_does_not_gain_oauth_betas() {
+        // The inverse of the previous test: a plain Anthropic API key must not be treated as
+        // OAuth, or Anthropic would reject it with an invalid-beta error.
+        let client = reqwest::Client::new();
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/messages",
+            &HeaderMap::new(),
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("anthropic", true, None),
+            "anthropic-api-key",
+            "rid-api-key",
+        )
+        .unwrap();
+        assert!(req.headers().get("anthropic-beta").is_none());
+        assert_eq!(req.headers().get("x-api-key").unwrap(), "anthropic-api-key");
+    }
+
+    #[test]
+    fn oauth_codex_request_carries_account_id() {
+        let client = reqwest::Client::new();
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/backend-api/codex/responses",
+            &HeaderMap::new(),
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("chatgpt_oauth", false, Some("acct-abc")),
+            "codex-token",
+            "rid-codex",
+        )
+        .unwrap();
+        let h = req.headers();
+        assert_eq!(
+            h.get(crate::provider_auth::CODEX_ACCOUNT_HEADER).unwrap(),
+            "acct-abc"
+        );
+        assert_eq!(
+            h.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer codex-token"
+        );
+    }
+
+    #[test]
+    fn oauth_xai_request_is_bearer_without_extra_headers() {
+        let client = reqwest::Client::new();
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/responses",
+            &HeaderMap::new(),
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("xai_oauth", false, None),
+            "xai-token",
+            "rid-xai",
+        )
+        .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer xai-token"
+        );
+        assert!(
+            req.headers()
+                .get(crate::provider_auth::CODEX_ACCOUNT_HEADER)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn client_authorization_never_reaches_the_provider_on_oauth_routes() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-brighto-key"),
+        );
+        let req = build_reqwest_request(
+            &client,
+            &Method::POST,
+            "http://127.0.0.1:9000/v1/messages",
+            &headers,
+            reqwest::Body::from(Bytes::from("{}")),
+            &resolve_auth_plan("anthropic_oauth", true, None),
+            "oauth-access-token",
+            "rid-no-leak",
+        )
+        .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer oauth-access-token",
+            "the provider credential must replace the client key, never merge with it"
         );
     }
 

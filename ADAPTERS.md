@@ -39,6 +39,58 @@ Provider key env vars:
 
 Keep stress tests on mock providers. Live provider smoke should stay small and cheap.
 
+## OAuth provider adapters
+
+The three OAuth providers are adapters in the same sense: each maps one client request shape onto a
+vendor path the router reaches with a renewable subscription credential. They are described here
+because, unlike the adapters above, they are not selected by task alone — the `auth_mode` decides
+how the credential travels, and the protocol decides the body shape.
+
+| Provider | `auth_mode` | Route protocol | Credential transport | Extra upstream headers |
+|---|---|---|---|---|
+| Claude Code | `anthropic_oauth` | `anthropic_messages` | `Authorization: Bearer <access_token>` | `anthropic-version`, merged `anthropic-beta` set, Claude CLI `User-Agent` |
+| Codex | `chatgpt_oauth` | `codex_responses` | `Authorization: Bearer <access_token>` | `chatgpt-account-id` |
+| xAI Grok | `xai_oauth` | `openai_responses` | `Authorization: Bearer <access_token>` | none |
+
+`codex_responses` exists to *mark* the route, not to change the path. `build_target_url` strips the
+incoming `/v1` when the base URL carries a path prefix, so base
+`https://chatgpt.com/backend-api/codex` plus incoming `/v1/responses` becomes
+`https://chatgpt.com/backend-api/codex/responses`, which is the real Codex endpoint. A bare
+`https://chatgpt.com` therefore 404s; the Portal warns when the base URL is edited away from the
+default.
+
+The `auth_mode` axis and the protocol axis are independent, and deliberately so:
+
+- `auth_mode` decides how the credential is transported and what else the request must carry. The
+  three OAuth modes are the only ones that consult the OAuth provider table for static headers.
+- The route protocol (equivalently, the backend template's dialect) decides the request body. Claude
+  OAuth is a **bearer** request to an Anthropic-dialect endpoint, which is why `anthropic-version` is
+  still required on it.
+
+Legacy `bearer` / `anthropic` / `none` modes take their header shape from the backend template
+exactly as before, so upgrading does not change a single byte of an existing upstream request.
+
+Beta headers are **merged** into whatever the caller sent, never substituted, and only on OAuth
+routes: a client that opts into a preview beta must keep working against a provider that later
+removes it from the CLI's default set.
+
+### Smoke testing an OAuth adapter
+
+There is no script for this, and that is deliberate. A live smoke would need a real subscription
+account and would spend real quota. `tests/oauth_smoke.rs` covers what can be covered without one:
+the reference grammar, the header contract, protocol defaults, route validation, and the refusals
+for a pasted key or a missing account. Verify a new provider by running **Test connection** in the
+Portal against a model you have already used successfully in that vendor's CLI, and treat the result
+as provider-specific rather than as a regression suite.
+
+### Adding a fourth OAuth provider
+
+Add one row to `oauth::PROVIDERS` in `src/oauth/mod.rs`. The flows, the token store, the refresh
+loop, the admin endpoints, the Portal UI, and the credential-reference grammar all read that table.
+The only things a new row must supply are its own facts: authorize/device/token URLs, client id,
+scopes, body encoding, refresh lead, `auth_mode`, protocol, base URLs, model suggestions, and a risk
+note. If a change requires a new `if provider ==` branch anywhere, it belongs in the row instead.
+
 ## System One Ollaya/Laya smoke
 
 To prove System One locally without a paid provider, run:

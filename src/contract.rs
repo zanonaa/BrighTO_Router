@@ -45,6 +45,10 @@ pub enum ProviderProtocol {
     AnthropicMessages,
     LocalOpenAiChat,
     CustomOpenAiChat,
+    /// ChatGPT Plus/Pro (Codex) qua ChatGPT OAuth. Responses API trên
+    /// `chatgpt.com/backend-api/codex/responses` — khác `openai_responses` ở path upstream
+    /// và ở requirement `chatgpt-account-id` trên mọi request.
+    CodexResponses,
 }
 
 impl ProviderProtocol {
@@ -68,6 +72,7 @@ impl ProviderProtocol {
             "anthropic_messages" | "messages" => ProviderProtocol::AnthropicMessages,
             "local_openai_chat" => ProviderProtocol::LocalOpenAiChat,
             "custom_openai_chat" => ProviderProtocol::CustomOpenAiChat,
+            "codex_responses" | "chatgpt_oauth_responses" => ProviderProtocol::CodexResponses,
             _ => ProviderProtocol::OpenAiChat,
         }
     }
@@ -88,6 +93,7 @@ impl ProviderProtocol {
             ProviderProtocol::AnthropicMessages => "anthropic_messages",
             ProviderProtocol::LocalOpenAiChat => "local_openai_chat",
             ProviderProtocol::CustomOpenAiChat => "custom_openai_chat",
+            ProviderProtocol::CodexResponses => "codex_responses",
         }
     }
 
@@ -97,7 +103,7 @@ impl ProviderProtocol {
             ProviderProtocol::OpenAiChat
             | ProviderProtocol::LocalOpenAiChat
             | ProviderProtocol::CustomOpenAiChat => "/v1/chat/completions",
-            ProviderProtocol::OpenAiResponses => "/v1/responses",
+            ProviderProtocol::OpenAiResponses | ProviderProtocol::CodexResponses => "/v1/responses",
             ProviderProtocol::OpenAiCompletions => "/v1/completions",
             ProviderProtocol::OpenAiEmbeddings => "/v1/embeddings",
             ProviderProtocol::OpenAiRerank
@@ -133,6 +139,7 @@ impl ProviderProtocol {
             ProviderProtocol::AnthropicMessages => "Anthropic Messages",
             ProviderProtocol::LocalOpenAiChat => "Local OpenAI-compatible Chat",
             ProviderProtocol::CustomOpenAiChat => "Custom OpenAI-compatible",
+            ProviderProtocol::CodexResponses => "Codex Responses (ChatGPT OAuth)",
         }
     }
 }
@@ -208,6 +215,9 @@ pub struct ModelEndpoint {
     pub max_inflight: u32,
     pub enabled: bool,
     pub provider_key: Option<String>,
+    /// OAuth account owning this credential (Codex `chatgpt_account_id`). Runtime-only,
+    /// resolved at config-load time from the token file, never written to the ledger.
+    pub oauth_account_id: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +226,7 @@ pub struct EffectiveModelEndpoint {
     pub provider_key: Option<String>,
     pub auth_mode: String,
     pub protocol: String,
+    pub oauth_account_id: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,12 +245,15 @@ pub struct ModelRoute {
     pub enabled: bool,
     /// Route-level credential: ref (file:/... | env:...) — NULL/empty chỉ khi auth_mode = none.
     pub provider_key_ref: Option<String>,
-    /// bearer | anthropic | none.
+    /// bearer | anthropic | none | anthropic_oauth | chatgpt_oauth | xai_oauth.
+    /// Xem `provider_auth::AUTH_MODES`.
     pub auth_mode: String,
     /// Route-level provider protocol (xem ProviderProtocol). Mặc định "openai_chat".
     pub protocol: String,
     /// Key đã resolve lúc load (runtime-only). None khi auth_mode = none.
     pub provider_key: Option<String>,
+    /// OAuth account owning this credential (Codex `chatgpt_account_id`). Runtime-only.
+    pub oauth_account_id: Option<Arc<str>>,
     /// Model Group load-balancing policy. Existing routes default to least_loaded_weighted.
     pub routing_policy: RoutingPolicy,
     /// Per-backend endpoint overrides for true mixed-provider groups. Empty keeps legacy single-endpoint behavior.
@@ -261,6 +275,10 @@ impl ModelRoute {
                     .or_else(|| self.provider_key.clone()),
                 auth_mode: endpoint.auth_mode.clone(),
                 protocol: endpoint.protocol.clone(),
+                oauth_account_id: endpoint
+                    .oauth_account_id
+                    .clone()
+                    .or_else(|| self.oauth_account_id.clone()),
             };
         }
         EffectiveModelEndpoint {
@@ -268,6 +286,7 @@ impl ModelRoute {
             provider_key: self.provider_key.clone(),
             auth_mode: self.auth_mode.clone(),
             protocol: self.protocol.clone(),
+            oauth_account_id: self.oauth_account_id.clone(),
         }
     }
 
@@ -458,6 +477,21 @@ mod tests {
             ProviderProtocol::parse("local_openai_chat"),
             ProviderProtocol::LocalOpenAiChat
         );
+        assert_eq!(
+            ProviderProtocol::parse("codex_responses"),
+            ProviderProtocol::CodexResponses
+        );
+        assert_eq!(
+            ProviderProtocol::parse("chatgpt_oauth_responses"),
+            ProviderProtocol::CodexResponses
+        );
+        // Codex speaks the Responses API shape but has its own wire path and account header,
+        // so it must not collapse into OpenAiResponses.
+        assert_ne!(
+            ProviderProtocol::parse("codex_responses"),
+            ProviderProtocol::OpenAiResponses
+        );
+        assert_eq!(ProviderProtocol::CodexResponses.as_str(), "codex_responses");
         // unknown/empty -> openai_chat (backward-compat)
         assert_eq!(ProviderProtocol::parse(""), ProviderProtocol::OpenAiChat);
         assert_eq!(
@@ -501,6 +535,13 @@ mod tests {
             ProviderProtocol::AnthropicMessages.incoming_path(),
             "/v1/messages"
         );
+        // Codex shares the client-facing endpoint with OpenAI Responses.
+        assert_eq!(
+            ProviderProtocol::CodexResponses.incoming_path(),
+            "/v1/responses"
+        );
+        assert!(ProviderProtocol::CodexResponses.accepts_incoming_path("/v1/responses"));
+        assert!(!ProviderProtocol::CodexResponses.accepts_incoming_path("/v1/chat/completions"));
         assert_eq!(
             ProviderProtocol::OpenAiChat.label(),
             "OpenAI Chat Completions"

@@ -17,7 +17,7 @@ The goal is a narrow, fast, understandable self-hosted LLM traffic path: one Rus
 
 ## Search terms
 
-open-source LLM gateway, free LLM router, LLM gateway, LLM router, AI gateway, model router, Rust LLM proxy, OpenAI-compatible gateway, Anthropic-compatible router, self-hosted AI gateway, SystemOne router, System One decisions, JEV router, DJEV router, Ollaya router, Laya model, LiteLLM alternative, Bifrost alternative, vLLM routing, load balancing for LLM endpoints.
+open-source LLM gateway, free LLM router, LLM gateway, LLM router, AI gateway, model router, Rust LLM proxy, OpenAI-compatible gateway, Anthropic-compatible router, self-hosted AI gateway, SystemOne router, System One decisions, JEV router, DJEV router, Ollaya router, Laya model, LiteLLM alternative, Bifrost alternative, vLLM routing, load balancing for LLM endpoints, Claude Code OAuth, Codex OAuth, Grok OAuth, Claude subscription router, ChatGPT Plus router, SuperGrok router.
 
 ## Benchmark summary
 
@@ -25,4 +25,4 @@ Benchmarks use deterministic local Rust mock backends and measure router overhea
 
 ## Privacy posture
 
-BrighTO-Router records metadata for usage analytics, such as tokens, route, provider, status, latency, and error class. It does not log prompt text, uploaded media, tool payloads, or model answers by design.
+BrighTO-Router records metadata for usage analytics, such as tokens, route, provider, status, latency, and error class. It does not log prompt text, uploaded media, tool payloads, or model answers by design. Connected OAuth credentials are stored on disk with owner-only permissions, never in PostgreSQL, and are never returned by an admin endpoint.

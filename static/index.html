@@ -28,6 +28,19 @@ body{font-family:var(--font);font-size:14px;line-height:1.5;color:var(--text);
 .hidden{display:none!important}
 code{font-family:var(--mono);background:rgba(30,41,59,.6);padding:2px 7px;border-radius:6px;font-size:12px;color:var(--accent-text)}
 
+/* ---------- OAuth ---------- */
+/* A risk note the operator must see before starting a flow: this traffic is billed and policed by
+   a provider whose terms BrighTO-Router does not control. */
+.oauth-risk{margin:12px 0 0;padding:10px 12px;border:1px solid rgba(245,183,73,.35);border-radius:8px;background:rgba(245,183,73,.08)}
+.oauth-flow-body{margin-top:14px;display:flex;flex-direction:column;gap:12px}
+.oauth-flow-body .field{width:100%}
+.oauth-flow-box{display:flex;flex-direction:column;gap:10px;align-items:flex-start;padding:12px;border:1px solid rgba(255,255,255,.1);border-radius:8px}
+.oauth-flow-box .row{gap:8px}
+.oauth-user-code{font-size:1.05rem}
+.oauth-user-code b{font-family:var(--mono);letter-spacing:.04em}
+.oauth-ref-note{color:var(--text-dim)}
+.oauth-account-table td{vertical-align:top}
+
 /* ---------- Login ---------- */
 #login-view{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px;position:relative;overflow:hidden}
 #login-view::before,#login-view::after{content:"";position:absolute;border-radius:50%;filter:blur(80px);opacity:.35;pointer-events:none}
@@ -365,6 +378,7 @@ table.conn-table td:first-child .cell-main{display:block!important;white-space:n
 .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .provider-connect-grid{grid-template-columns:minmax(180px,.85fr) minmax(220px,1.28fr) minmax(220px,1.28fr);align-items:start;margin-bottom:13px}
 .provider-connect-grid .provider-key-field{grid-column:1 / -1;max-width:560px}
+.provider-connect-grid .oauth-account-field{grid-column:1 / -1;max-width:560px;gap:6px}
 .form-grid .field{margin-bottom:0}
 .route-model-grid{grid-template-columns:minmax(0,1.25fr) minmax(0,.95fr);align-items:start;margin-bottom:13px}
 .model-map{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:stretch;background:#0b1220;border:1px solid var(--border);border-radius:14px;padding:12px;margin:4px 0 16px}
@@ -720,6 +734,9 @@ var mode = "admin";
 var authKey = "";
 var loginBusy = false;
 var backends = [], routes = [], teams = [], keys = [], catalog = [];
+/* Connected OAuth accounts. Loaded lazily alongside `catalog`: an admin on a build with no OAuth
+   provider connected must not pay for a request that can only 404. */
+var oauthProviders = [], oauthAccounts = [];
 
 function $(id){ return document.getElementById(id); }
 function el(tag, cls, text){ var n=document.createElement(tag); if(cls)n.className=cls; if(text!==undefined)n.textContent=text; return n; }
@@ -896,6 +913,7 @@ async function refresh(){
       teams=await api("/admin/teams","GET");
       keys=await api("/admin/keys","GET");
       try{ catalog=await api("/admin/provider-catalog","GET"); }catch(e){ catalog=[]; }
+      await refreshOAuth();
     }
     var cur=document.querySelector(".nav.active");
     if(cur) render(cur.dataset.view); else go("dashboard");
@@ -1284,7 +1302,7 @@ function renderProviders(c){
       tr.appendChild(el("td","num",String(b.usage_count||0)));
       var bu=el("td","mono"); var bus=el("span","truncate compact-line",b.base_url.replace("https://","").replace("http://","")); bus.title=b.base_url; bu.appendChild(bus); tr.appendChild(bu);
       var td=el("td","actions"); var row=el("div","action-row");
-      var cr=el("button","btn sm primary","Route"); cr.title="Create a model route from this provider endpoint"; cr.onclick=function(){ openRouteModalFromConnection(b); };
+      var cr=el("button","btn sm primary","Route"); cr.title="Create a model route from this provider endpoint"; cr.onclick=function(){ openRouteModalForConnection(b); };
       var tg2=el("button","btn sm ghost", b.enabled?"Disable":"Enable"); tg2.onclick=function(){ toggleBackend(b); };
       var e=el("button","btn sm ghost","Edit"); e.onclick=function(){openProviderModal(b);};
       var d=el("button","btn sm danger","Delete");
@@ -1296,9 +1314,300 @@ function renderProviders(c){
     t.appendChild(tb); w.appendChild(t); p.appendChild(w);
   }
   c.appendChild(p);
+  // Accounts sit below the endpoint table: the endpoint is the reusable piece, and an account is
+  // what a route points at.
+  c.appendChild(renderOAuthPanel());
 }
 
-function openRouteModalFromConnection(b){ window.presetConnection=b; openRouteModal(null,{mode:"single"}); }
+function openRouteModalForConnection(b){ window.presetConnection=b; openRouteModal(null,{mode:"single"}); }
+/* Open the route wizard already pointed at a connected account, so an operator who just connected
+   one lands in "pick a model" rather than back at the provider list. */
+function openRouteModalForAccount(spec,account){
+  window.presetConnection={name:(spec&&spec.label)||account.provider,base_url:(spec&&spec.api_base_url)||"",oauth_provider:account.provider,oauth_label:account.label};
+  openRouteModal(null,{mode:"single"});
+}
+
+/* ===== OAuth accounts ===== */
+/* OAuth providers are reached through a browser login the router cannot perform itself, so the
+   Portal is the only place a connect flow can live. Two shapes, from the provider table:
+   - pkce: open an authorize URL, then paste back whatever the browser landed on.
+   - device_code: show a short code, then poll until the operator approves elsewhere.
+   Both are driven from /admin/oauth/{provider}/start and /complete. */
+
+function oauthSpec(key){ return (oauthProviders||[]).find(function(p){return p.key===key;})||null; }
+function oauthAccountsFor(key){ return (oauthAccounts||[]).filter(function(a){return a.provider===key;}); }
+/* The route stores a reference, never a token: `oauth:<provider>:<label>`. */
+function oauthCredentialRef(provider,label){ return "oauth:"+provider+":"+label; }
+function oauthTokenStateKind(state){
+  return ({ok:"on",expiring:"warn",expired:"off",no_refresh_token:"warn"})[state]||"info";
+}
+function oauthTokenStateLabel(state){
+  return ({ok:"Connected",expiring:"Expiring soon",expired:"Expired — reconnect",no_refresh_token:"Connected (no auto-renewal)"})[state]||state;
+}
+function oauthTokenStateNote(state){
+  return ({ok:"The router renews this credential automatically.",
+          expiring:"Renewal is due; if it fails the router asks you to reconnect.",
+          expired:"This credential is past its expiry. Connect again.",
+          no_refresh_token:"No refresh token was issued, so the router cannot renew this. Reconnect before it expires."})[state]||"";
+}
+
+async function refreshOAuth(){
+  try{
+    var p=await api("/admin/oauth/providers","GET"); oauthProviders=p.providers||[];
+  }catch(e){ oauthProviders=[]; }
+  try{
+    var a=await api("/admin/oauth/accounts","GET"); oauthAccounts=a.accounts||[];
+  }catch(e){ oauthAccounts=[]; }
+}
+
+/* `api()` throws on any non-2xx and hands back only the parsed body. The OAuth flows need the
+   status too: a device poll answers 202 while the operator has not approved yet, and that is a
+   state to keep, not an error to report. */
+async function oauthPost(path, body){
+  var res;
+  try{ res=await fetch(path,{method:"POST",headers:authHeaders(),body:JSON.stringify(body||{})}); }
+  catch(e){ throw new Error("Network error. Check the connection and try again."); }
+  var text=await res.text();
+  var data=null;
+  try{ data=text?JSON.parse(text):null; }catch(e){ data=null; }
+  if(!res.ok){
+    var msg=(data&&(data.error&&(data.error.message||data.error)))||(data&&data.message)||text||("HTTP "+res.status);
+    throw new Error(res.status+" "+msg);
+  }
+  return {status:res.status, data:data||{}};
+}
+
+function renderOAuthPanel(){
+  var p=el("div","panel");
+  var h=el("div","panel-head");
+  h.appendChild(el("h3",null,"Connected accounts"));
+  var acts=el("div","panel-head-actions");
+  if(oauthProviders.length){
+    var add=el("button","btn primary sm","Connect account");
+    add.onclick=function(){ openOAuthModal(); };
+    acts.appendChild(add);
+  }
+  h.appendChild(acts);
+  p.appendChild(h);
+  p.appendChild(el("p","hint","OAuth accounts are used by third-party CLIs like Claude Code and Codex. The router stores the credential on disk (owner-only), renews it automatically, and never sends it to a client. Anthropic and xAI may require extra paid usage for traffic from an unofficial client — check your plan before sending real workloads."));
+
+  if(!oauthProviders.length){
+    p.appendChild(emptyBox("This build has no OAuth providers compiled in."));
+    return p;
+  }
+  if(!oauthAccounts.length){
+    p.appendChild(emptyBox("No account connected yet. Connect one to add a route without pasting an API key."));
+    return p;
+  }
+  var w=el("div","table-wrap pro-table oauth-account-table");
+  var t=el("table","conn-table");
+  var colg=document.createElement("colgroup");
+  ["24%","20%","34%","22%"].forEach(function(wid){ var c=document.createElement("col"); c.style.width=wid; colg.appendChild(c); });
+  t.appendChild(colg);
+  t.appendChild(thead(["Provider","Account","Token",""]));
+  var tb=el("tbody");
+  oauthAccounts.forEach(function(a){
+    var spec=oauthSpec(a.provider);
+    var tr=el("tr"); tr.setAttribute("data-provider",a.provider); tr.setAttribute("data-label",a.label);
+    var nc=el("td");
+    var ns=el("div","stack-cell");
+    ns.appendChild(el("div","cell-main compact-line",spec?spec.label:a.provider));
+    ns.appendChild(el("div","cell-sub","oauth:"+a.provider+":*"));
+    nc.appendChild(ns); tr.appendChild(nc);
+    var ac=el("td");
+    var as=el("div","stack-cell");
+    as.appendChild(el("div","cell-main compact-line",a.account_name||a.label));
+    as.appendChild(el("div","cell-sub",a.account_name?a.label:""));
+    ac.appendChild(as); tr.appendChild(ac);
+    var tc=el("td");
+    var ts=el("div","stack-cell");
+    var tp=pill(oauthTokenStateLabel(a.last_refresh_state),oauthTokenStateKind(a.last_refresh_state)); tp.classList.add("compact");
+    ts.appendChild(tp);
+    ts.appendChild(el("div","status-note",oauthTokenStateNote(a.last_refresh_state)));
+    tc.appendChild(ts); tr.appendChild(tc);
+    var td=el("td","actions");
+    var row=el("div","action-row");
+    var addRoute=el("button","btn sm","Add route");
+    addRoute.title="Create a model route that uses this connected account";
+    addRoute.onclick=function(){ openRouteModalForAccount(spec||{key:a.provider},a); };
+    var dis=el("button","btn sm danger","Disconnect");
+    dis.onclick=function(){ disconnectOAuthAccount(a); };
+    row.appendChild(addRoute); row.appendChild(dis); td.appendChild(row); tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb); w.appendChild(t); p.appendChild(w);
+  return p;
+}
+
+async function disconnectOAuthAccount(a){
+  var providerLabel=(oauthSpec(a.provider)||{}).label||a.provider;
+  if(!confirm("Disconnect "+providerLabel+" ("+(a.account_name||a.label)+")? Routes using this account will stop working until you connect again.")) return;
+  try{
+    var r=await api("/admin/oauth/accounts/"+encodeURIComponent(a.provider)+"/"/+encodeURIComponent(a.label),"DELETE");
+    var left=(r.routes_referencing_credential||[]).length+(r.endpoints_referencing_credential||0);
+    toast(left?("Disconnected — "+left+" route reference(s) still point at this credential and will fail."):"Account disconnected", left?"err":"");
+    await refreshOAuth(); rerender();
+  }catch(e){ toast("Disconnect failed: "+e.message,"err"); }
+}
+
+/* The connect modal. Which affordance appears is decided by the provider table, not guessed in
+   the browser: the two flows have genuinely different steps. */
+function openOAuthModal(presetKey){
+  var ov=$("modal-overlay"); ov.innerHTML="";
+  var m=el("div","modal oauth-modal");
+  var pickKey=presetKey||"";
+  m.appendChild(modalHeader(presetKey?("Connect "+((oauthSpec(pickKey)||{}).label||pickKey)):"Connect an account"));
+  if(!oauthProviders.length){
+    m.appendChild(el("p","hint","This build has no OAuth providers compiled in."));
+    var c0=el("div","actions"); var x0=el("button","btn","Close"); x0.onclick=closeModal; c0.appendChild(x0); m.appendChild(c0);
+    ov.appendChild(m); ov.classList.remove("hidden"); return;
+  }
+
+  var fp=el("div","field"); fp.appendChild(el("label",null,"Provider"));
+  var ps=el("select");
+  oauthProviders.forEach(function(p){ var o=el("option",null,p.label+(p.accounts?" ("+p.accounts+" connected)":"")); o.value=p.key; ps.appendChild(o); });
+  if(!pickKey) pickKey=oauthProviders[0].key;
+  ps.value=pickKey; fp.appendChild(ps);
+  m.appendChild(fp);
+
+  var risk=el("div","oauth-risk hidden");
+  var body=el("div","oauth-flow-body");
+  m.appendChild(risk); m.appendChild(body);
+
+  function spec(){ return oauthSpec(ps.value); }
+  /* Disable a button and swap its label for the duration of one request, then put the idle label
+     back. Without the second label the button would stay stuck saying "Starting…". */
+  function setBusy(on,btn,busyLabel,idleLabel){ if(!btn) return; btn.disabled=on; btn.textContent=on?busyLabel:idleLabel; }
+
+  function renderPicker(){
+    var sp=spec();
+    risk.textContent=sp&&sp.risk_note?sp.risk_note:"";
+    risk.classList.toggle("hidden",!(sp&&sp.risk_note));
+    body.innerHTML="";
+    body.appendChild(el("p","hint","You will sign in on the provider's own site. BrighTO-Router never sees your password, and stores only the resulting credential on disk."));
+    if(sp.flow==="pkce") renderPkce(sp); else renderDevice(sp);
+  }
+
+  /* PKCE: we cannot run a loopback listener from the Portal, so the operator authorizes in their
+     own browser and pastes back the URL they ended on. `extract_code` accepts a bare code too. */
+  function renderPkce(sp){
+    var startBtn=el("button","btn primary","Get sign-in link");
+    var step1=el("div"); step1.appendChild(startBtn);
+    var urlBox=el("div","oauth-flow-box hidden");
+    var openLink=el("a","btn primary","Open sign-in page");
+    var copyBtn=el("button","btn sm ghost","Copy link");
+    var linkRow=el("div","row"); linkRow.appendChild(openLink); linkRow.appendChild(copyBtn);
+    urlBox.appendChild(linkRow);
+    var step2=el("div","hidden");
+    var pasteField=el("div","field");
+    pasteField.appendChild(el("label",null,"Paste the URL your browser was redirected to"));
+    var paste=el("input"); paste.placeholder="http://localhost:54545/callback?code=…";
+    pasteField.appendChild(paste);
+    pasteField.appendChild(el("p","hint","The browser will show a connection error because nothing is listening on that address — that is expected. Copy the full address bar and paste it here."));
+    var completeBtn=el("button","btn primary","Finish connect");
+    step2.appendChild(pasteField); step2.appendChild(completeBtn);
+    body.appendChild(step1); body.appendChild(urlBox); body.appendChild(step2);
+
+    var authorizeUrl=null, state=null;
+    startBtn.onclick=async function(){
+      setBusy(true,startBtn,"Starting…","Get a new sign-in link");
+      try{
+        var r=await oauthPost("/admin/oauth/"+encodeURIComponent(sp.key)+"/start",{});
+        authorizeUrl=r.data.authorize_url; state=r.data.state;
+        if(!authorizeUrl) throw new Error("provider returned no sign-in URL");
+        openLink.href=authorizeUrl; openLink.target="_blank"; openLink.rel="noopener noreferrer";
+        copyBtn.onclick=async function(){ try{ await navigator.clipboard.writeText(authorizeUrl); toast("Link copied"); }catch(e){ toast("Copy failed — select the link manually","err"); } };
+        urlBox.classList.remove("hidden"); step2.classList.remove("hidden");
+        startBtn.textContent="Get a new sign-in link";
+      }catch(e){ toast("Start failed: "+e.message,"err"); }
+      finally{ setBusy(false,startBtn,"Starting…","Get sign-in link"); }
+    };
+    completeBtn.onclick=async function(){
+      var raw=paste.value.trim();
+      if(!raw){ toast("Paste the redirect URL first","err"); paste.focus(); return; }
+      setBusy(true,completeBtn,"Connecting…","Finish connect");
+      try{ await exchange(sp,{code:raw,state:state}); }
+      catch(e){ toast("Connect failed: "+e.message,"err"); }
+      finally{ setBusy(false,completeBtn,"Connecting…","Finish connect"); }
+    };
+  }
+
+  /* Device code: xAI hands back a short code the operator types on another device. Poll until
+     approved; a 202 means "not yet", not an error, so keep the interval the provider asked for. */
+  function renderDevice(sp){
+    var startBtn=el("button","btn primary","Get sign-in code");
+    var step1=el("div"); step1.appendChild(startBtn);
+    var codeBox=el("div","oauth-flow-box hidden");
+    var codeLine=el("div","oauth-user-code");
+    var link=el("a","btn","Open the verification page");
+    var status=el("p","hint");
+    var pollWrap=el("div","row");
+    var pollBtn=el("button","btn primary","Check approval");
+    pollWrap.appendChild(pollBtn);
+    codeBox.appendChild(codeLine); codeBox.appendChild(link); codeBox.appendChild(status); codeBox.appendChild(pollWrap);
+    body.appendChild(step1); body.appendChild(codeBox);
+
+    var flowId=null, timer=null, interval=5000, waiting=false;
+    startBtn.onclick=async function(){
+      setBusy(true,startBtn,"Requesting…","Get a new code");
+      try{
+        // The Portal owns the id because it has to poll with something, and the device flow has
+        // no redirect URL to read a state out of. The router adopts it so the device code lands
+        // under the key this poll will use.
+        flowId="portal-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,12);
+        var r=await oauthPost("/admin/oauth/"+encodeURIComponent(sp.key)+"/start",{flow_id:flowId});
+        flowId=r.data.state||flowId;
+        interval=Math.max(2,(r.data.poll_interval_secs||5))*1000;
+        codeLine.textContent="";
+        codeLine.appendChild(el("b",null,"Code: "+(r.data.user_code||"—")));
+        if(r.data.verification_uri){ link.href=r.data.verification_uri; link.target="_blank"; link.rel="noopener noreferrer"; } else link.classList.add("hidden");
+        codeBox.classList.remove("hidden");
+        status.textContent="Not approved yet. Approve it in your browser, then check again.";
+        startBtn.textContent="Get a new code";
+      }catch(e){ toast("Start failed: "+e.message,"err"); }
+      finally{ setBusy(false,startBtn,"Requesting…","Get a new code"); }
+    };
+    async function poll(){
+      if(!flowId||waiting) return;
+      waiting=true; pollBtn.disabled=true;
+      try{
+        var r=await oauthPost("/admin/oauth/"+encodeURIComponent(sp.key)+"/complete",{code:"",state:flowId});
+        // 202 is the router saying "the operator has not approved yet". It is a normal state, so
+        // it has to be checked before anything treats the body as a connected account.
+        if(r.status===202){
+          status.textContent="Still waiting for approval…";
+          if(!timer) timer=setTimeout(function(){ timer=null; poll(); },interval);
+          return;
+        }
+        await connected(sp,r.data);
+      }catch(e){ toast("Check failed: "+e.message,"err"); }
+      finally{ waiting=false; pollBtn.disabled=false; }
+    }
+    pollBtn.onclick=poll;
+  }
+
+  /* PKCE has no polling, so its exchange must fail loudly rather than report a phantom success:
+     a 202 here would mean the router answered a state-less exchange. */
+  async function exchange(sp,body){
+    var r=await oauthPost("/admin/oauth/"+encodeURIComponent(sp.key)+"/complete",body);
+    if(r.status===202) throw new Error("provider has not authorized this request yet; start again");
+    await connected(sp,r.data);
+  }
+
+  async function connected(sp,d){
+    await refreshOAuth();
+    closeModal(); rerender();
+    var ref=d&&d.provider_key_ref;
+    toast("Connected "+((oauthSpec(sp.key)||{}).label||sp.key)+(ref?(" ("+ref+")"):"")+". Add a model route to use it.");
+  }
+
+  ps.onchange=renderPicker;
+  renderPicker();
+  var act=el("div","actions");
+  var cancel=el("button","btn","Cancel"); cancel.onclick=closeModal;
+  act.appendChild(cancel); m.appendChild(act);
+  ov.appendChild(m); ov.classList.remove("hidden");
+}
 
 async function toggleBackend(b){
   try{
@@ -1328,11 +1637,19 @@ function openProviderModal(b){
   // Chọn provider từ catalog hard-coded trong .env (chỉ 2 dialect: openai/anthropic).
   var fp=el("div","field"); fp.appendChild(el("label",null,"Provider"));
   var psel=el("select");
-  (catalog||[]).forEach(function(e){ var o=el("option",null, e.enabled===false ? e.label+" (coming soon)" : e.label); o.value=e.key; if(e.enabled===false) o.disabled=true; psel.appendChild(o); });
-  if(!(catalog||[]).length){ var no=el("option",null,"Custom LLM"); no.value="custom"; psel.appendChild(no); }
-  var pre=(catalog||[]).find(function(e){ return b.name && (b.name===e.label || b.name.toLowerCase().indexOf(e.key)>=0); });
+  /* Catalog plus any OAuth provider the admin API reports. Deduplicated by key: an operator who
+     also listed an OAuth provider in PROVIDER_CATALOG overrides its base URL, and the catalog
+     entry wins because it is the more specific statement. */
+  var presets=[]; var seenPresets={};
+  (catalog||[]).concat(oauthProviders.map(function(p){ return {key:p.key,label:p.label,base_url:p.api_base_url,dialect:(p.auth_mode==="anthropic_oauth"?"anthropic":"openai"),key_env:"",key_set:false,enabled:true,oauth:true,oauth_flow:p.flow,oauth_auth_mode:p.auth_mode,oauth_risk_note:p.risk_note}; })).forEach(function(e){
+    if(!e.key||seenPresets[e.key]) return;
+    seenPresets[e.key]=true; presets.push(e);
+  });
+  presets.forEach(function(e){ var o=el("option",null, e.enabled===false ? e.label+" (coming soon)" : e.label); o.value=e.key; if(e.enabled===false) o.disabled=true; psel.appendChild(o); });
+  if(!presets.length){ var no=el("option",null,"Custom LLM"); no.value="custom"; psel.appendChild(no); }
+  var pre=presets.find(function(e){ return b.name && (b.name===e.label || b.name.toLowerCase().indexOf(e.key)>=0); });
   if(pre) psel.value=pre.key;
-  else if(b.name && (catalog||[]).length) psel.value=(catalog[0].key||"custom");
+  else if(b.name && presets.length) psel.value=(presets[0].key||"custom");
   fp.appendChild(psel); m.appendChild(fp);
   m.appendChild(el("div","section-title","Endpoint"));
   var fname=el("div","field"); fname.appendChild(el("label",null,"Name"));
@@ -1345,6 +1662,21 @@ function openProviderModal(b){
     if(e.base_url && (resetUrl || !urlIn.value.trim())) urlIn.value=e.base_url;
   }
   psel.onchange=function(){ applyCat(true); }; applyCat(false);
+  /* An OAuth preset's base URL is not a suggestion — Codex needs the `/backend-api/codex`
+     path prefix, and a bare host makes every request 404. Warn instead of silently producing a
+     broken endpoint the operator will only discover on a failed Test connection. */
+  var oaNote=el("p","hint");
+  m.appendChild(oaNote);
+  function applyOauthNote(){
+    var e=catEntry(psel.value);
+    var need=e.oauth?((oauthSpec(e.key)||{}).api_base_url||e.base_url):"";
+    var bad=e.oauth && need && urlIn.value.trim() && urlIn.value.trim().replace(/\/+$/,"")!==need.replace(/\/+$/,"");
+    oaNote.textContent=bad
+      ?"Heads up: "+e.label+" OAuth expects "+need+". A different base URL only works if it is a gateway that forwards to the provider's own path."
+      :"";
+    oaNote.classList.toggle("hidden",!oaNote.textContent);
+  }
+  urlIn.oninput=applyOauthNote; applyOauthNote();
   var hasLoadControl=!!(b.id&&((b.weight&&b.weight!==1)||(b.max_inflight&&b.max_inflight>0)));
   var loadOpen=hasLoadControl;
   var loadWrap=el("div","advanced-wrap");
@@ -1692,6 +2024,7 @@ function openRouteModal(route,opts){
 
   function providerSupportsTask(e,task){
     var k=(e.key||"").toLowerCase();
+    if(e.oauth) return oauthTaskSupported(k,task);
     if(k==="custom" || k==="custom-llm") return true;
     if(task==="chat" || task==="responses") return ["jina","voyage","cohere"].indexOf(k)<0;
     if(task==="completion") return ["anthropic","jina","voyage","cohere","ollaya"].indexOf(k)<0;
@@ -1752,6 +2085,59 @@ function openRouteModal(route,opts){
   keyRow.appendChild(pk); keyRow.appendChild(showKey);
   var keyHint=el("p","hint");
   fk.appendChild(keyRow); fk.appendChild(keyHint); providerGrid.appendChild(fk);
+
+  /* An OAuth provider has no API key to paste, so the same slot holds a connected-account picker.
+     Both stay in the DOM and swap visibility: `pk` is referenced by every handler below, and
+     rebuilding the field on provider change would reset a half-typed key on every keystroke. */
+  var fo=el("div","field oauth-account-field hidden");
+  fo.appendChild(el("label",null,"Connected account"));
+  var accRow=el("div","input-action-row");
+  var accountSel=el("select");
+  var connectBtn=el("button","btn ghost"); connectBtn.type="button"; connectBtn.textContent="Connect account";
+  accRow.appendChild(accountSel); accRow.appendChild(connectBtn);
+  var accHint=el("p","hint");
+  fo.appendChild(accRow); fo.appendChild(accHint);
+  providerGrid.appendChild(fo);
+  /* Which account the route will use; "" means none chosen yet. */
+  var chosenAccount={label:""};
+  function refreshAccountOptions(){
+    var e=catEntry(ps.value);
+    var want=chosenAccount.label;
+    accountSel.innerHTML="";
+    var mine=oauthAccountsFor(e.key||"");
+    if(!mine.length){
+      var none=el("option",null,"No account connected"); none.value=""; accountSel.appendChild(none);
+    }else{
+      mine.forEach(function(a){
+        var o=el("option",null,(a.account_name||a.label)+" — "+oauthTokenStateLabel(a.last_refresh_state));
+        o.value=a.label; accountSel.appendChild(o);
+      });
+    }
+    if(want && mine.some(function(a){return a.label===want;})) accountSel.value=want;
+    else chosenAccount.label=accountSel.value||"";
+    accHint.textContent=mine.length
+      ?"The route stores a reference to this account; the router renews the credential automatically."
+      :"Connect an account first. Without one there is no credential to send upstream.";
+    connectBtn.textContent=mine.length?"Connect another":"Connect account";
+  }
+  accountSel.onchange=function(){ chosenAccount.label=accountSel.value||""; clearTest("Account changed — test connection again before saving enabled."); };
+  connectBtn.onclick=function(){
+    openOAuthModal(ps.value);
+    // The connect modal closes itself; re-check for a new account when it does.
+    var wait=setInterval(function(){
+      if($("modal-overlay").classList.contains("hidden")){
+        clearInterval(wait);
+        refreshOAuth().then(function(){ refreshAccountOptions(); rerender(); });
+      }
+    },400);
+  };
+  function applyAccountVisibility(e){
+    var isOauth=!!e.oauth;
+    fk.classList.toggle("hidden",isOauth);
+    fo.classList.toggle("hidden",!isOauth);
+    if(isOauth) refreshAccountOptions();
+    return isOauth;
+  }
   m.appendChild(providerGrid);
   var testState={ok:false};
   var endpointTest={ok:false,candidate:null};
@@ -1761,6 +2147,7 @@ function openRouteModal(route,opts){
     var task=ts.value;
     var providerKey=(e.key||"").toLowerCase();
     var qwenRerank=providerKey==="qwen" && task==="rerank";
+    var isOauth=applyAccountVisibility(e);
     if(qwenRerank){
       var qwenDefault=e.base_url||"";
       var qwenRerankBase="https://dashscope-intl.aliyuncs.com";
@@ -1790,7 +2177,8 @@ function openRouteModal(route,opts){
       applyCat.oldProviderModel="";
       applyCat.oldPublicModel="";
     }
-    if(providerKey==="custom-llm" || providerKey==="custom") keyHint.textContent="Custom LLM may be no-auth. Leave blank for local/no-auth endpoints, or paste a provider key if your endpoint requires one.";
+    if(isOauth) keyHint.textContent="This provider signs in through its own website, so no API key is used.";
+    else if(providerKey==="custom-llm" || providerKey==="custom") keyHint.textContent="Custom LLM may be no-auth. Leave blank for local/no-auth endpoints, or paste a provider key if your endpoint requires one.";
     else if(e.key_set){ keyHint.textContent="Using key from .env ("+e.key_env+") — leave blank to use it, or paste to override."; }
     else if(e.key_env){ keyHint.textContent="No key in .env ("+e.key_env+") — paste the API key (stored per model, write-only)."; }
     else { keyHint.textContent="Paste a provider key when the endpoint requires one. Leave blank for local or no-auth endpoints."; }
@@ -1817,11 +2205,48 @@ function openRouteModal(route,opts){
   applyCat();
   url.oninput=function(){ clearTest(""); };
   pk.oninput=function(){ clearTest(""); };
+  /* Pick a task the chosen provider can actually serve. The provider list is filtered by task, so
+     choosing the provider first would leave it absent from its own dropdown (Codex is
+     Responses-only and would simply not be selectable while the task said "chat"). */
+  function firstSupportedTask(providerKey){
+    for(var i=0;i<ts.options.length;i++){
+      if(providerSupportsTask(catEntry(providerKey),ts.options[i].value)) return ts.options[i].value;
+    }
+    return "chat";
+  }
   if(window.presetConnection){
     var pc=window.presetConnection; window.presetConnection=null;
-    var ck=(catalog||[]).find(function(e){ return pc.name===e.label || pc.name.toLowerCase().indexOf(e.key)>=0; });
-    if(ck && ck.enabled!==false){ ps.value=ck.key; applyCat(); }
+    if(pc.oauth_provider){
+      // Arriving from the accounts panel: the provider and the account are already decided.
+      ts.value=firstSupportedTask(pc.oauth_provider);
+      refreshProviderOptions();
+      ps.value=pc.oauth_provider; chosenAccount.label=pc.oauth_label||"";
+      var sug0=(oauthSpec(pc.oauth_provider)||{}).models||[];
+      // The account is pre-chosen, so the wizard opens on step 2 rather than on the provider grid.
+      if(sug0.length&&!ms.value){ ms.value=sug0[0]; if(!mi.value) mi.value=sug0[0]; }
+    }else{
+      var ck=(catalog||[]).find(function(e){ return pc.name===e.label || pc.name.toLowerCase().indexOf(e.key)>=0; });
+      if(ck && ck.enabled!==false){ ts.value=firstSupportedTask(ck.key); refreshProviderOptions(); ps.value=ck.key; }
+    }
     url.value=pc.base_url||url.value;
+    applyCat();
+  }
+  /* Editing an OAuth route: recover the stored reference so the save does not null it. */
+  var storedOauthRef=(route.provider_key_ref||"").indexOf("oauth:")===0 ? route.provider_key_ref : "";
+  if(storedOauthRef){
+    var parts=storedOauthRef.split(":");
+    if(parts.length>=3){
+      chosenAccount.label=parts.slice(2).join(":");
+      ts.value=firstSupportedTask(parts[1]);
+      refreshProviderOptions();
+      ps.value=parts[1];
+      // Keep the base URL the route actually uses. An operator who pointed Claude at a gateway
+      // would otherwise have it silently rewritten to the default on the next save.
+      var rb0=backends.find(function(x){return x.id===(route.backend_ids&&route.backend_ids[0]);});
+      var spec0=oauthSpec(parts[1]);
+      url.value=(rb0&&rb0.base_url)||url.value||(spec0&&spec0.api_base_url)||"";
+      applyCat(false);
+    }
   }
 
   m.appendChild(el("div","section-title","Model"));
@@ -1884,7 +2309,7 @@ function openRouteModal(route,opts){
   groupEndpoints=(route.endpoints||[]).map(endpointFromSaved);
   function currentEndpointCandidate(){
     var da=dialAuth(); var e=catEntry(ps.value); var kp=keyPayload();
-    return {local_id:"new-"+(groupEndpointSeq++),backend_id:null,provider_label:e.label||"Custom LLM",provider_key:kp.provider_key||"",provider_key_ref:kp.provider_key_ref||"",base_url:url.value.trim(),dialect:da.dialect,auth:da.auth,protocol:da.protocol,provider_model_name:ms.value.trim(),weight:Math.max(1,Number(ew.value)||1),max_inflight:Math.max(0,Number(em.value)||0),enabled:true,tested:true};
+    return {local_id:"new-"+(groupEndpointSeq++),backend_id:null,provider_label:e.label||"Custom LLM",provider_key:kp.provider_key||"",provider_key_ref:kp.provider_key_ref||"",base_url:url.value.trim(),dialect:da.dialect,auth:da.auth,protocol:da.protocol,provider_model_name:ms.value.trim(),weight:Math.max(1,Number(ew.value)||1),max_inflight:Math.max(0,Number(em.value)||0),enabled:true,tested:true,oauth:!!e.oauth};
   }
   function renderGroupEndpoints(){
     endpointList.innerHTML="";
@@ -1894,6 +2319,9 @@ function openRouteModal(route,opts){
       var main=el("div","group-endpoint-main");
       var title=el("div","group-endpoint-title"); title.appendChild(el("span",null,(idx+1)+". "+ep.provider_label)); title.appendChild(el("code",null,ep.provider_model_name||"provider model")); title.appendChild(pill(ep.auth==="none"?"no key":"key",ep.auth==="none"?"info":"on")); main.appendChild(title);
       main.appendChild(el("div","group-endpoint-meta",ep.base_url+" · "+protoLabel(ep.protocol)+" · weight "+ep.weight+" · max inflight "+(ep.max_inflight||"∞")));
+      if(ep.oauth||(ep.provider_key_ref||"").indexOf("oauth:")===0){
+        main.appendChild(el("div","group-endpoint-meta oauth-ref-note","OAuth account · "+(ep.provider_key_ref||"")));
+      }
       card.appendChild(main);
       var acts=el("div","group-endpoint-actions"); var rm=el("button","btn sm danger","Remove"); rm.type="button"; rm.onclick=function(){ groupEndpoints=groupEndpoints.filter(function(x){return x.local_id!==ep.local_id;}); renderGroupEndpoints(); }; acts.appendChild(rm); card.appendChild(acts);
       endpointList.appendChild(card);
@@ -1967,6 +2395,14 @@ function openRouteModal(route,opts){
   function dialAuth(){
     var e=catEntry(ps.value);
     var task=ts.value;
+    // An OAuth credential decides both the header transport and the route protocol. It cannot fall
+    // back to the backend template's dialect: Claude rides a bearer token on an Anthropic route,
+    // while Codex needs its own Responses upstream path.
+    if(e.oauth){
+      var oa=e.oauth_auth_mode||((oauthSpec(e.key)||{}).auth_mode)||"";
+      var op=(oauthSpec(e.key)||{}).protocol||(e.key==="claude-code"?"anthropic_messages":(e.key==="codex"?"codex_responses":"openai_responses"));
+      return { dialect:e.dialect, auth:oa, protocol:op };
+    }
     var local = isLocalUrl(url.value.trim());
     var noAuthCustom = ((e.key||"").toLowerCase()==="custom-llm" || (e.key||"").toLowerCase()==="custom") && !pk.value.trim();
     var auth=((local || noAuthCustom) && !pk.value.trim())?"none":"bearer";
@@ -1990,11 +2426,23 @@ function openRouteModal(route,opts){
   }
   function keyPayload(){
     var e=catEntry(ps.value);
+    // An OAuth route stores a credential reference, never a token. A pasted key is rejected by
+    // the admin API on purpose: it would expire within the hour with no refresh token behind it.
+    if(e.oauth){
+      if(!chosenAccount.label) return {__missingOAuthAccount:true};
+      return {provider_key_ref:oauthCredentialRef(e.key,chosenAccount.label)};
+    }
     if(pk.value.trim()) return {provider_key:pk.value.trim()};
     // Only auto-apply the .env key to non-local, non-custom cloud URLs.
     var k=(e.key||"").toLowerCase();
     if(e.key_env && e.key_set && !isLocalUrl(url.value.trim()) && k!=="custom-llm" && k!=="custom") return {provider_key_ref:"env:"+e.key_env};
     return {};
+  }
+  /* Strip the internal marker before a payload reaches the network. */
+  function keyPayloadOrFail(){
+    var kp=keyPayload();
+    if(kp.__missingOAuthAccount){ toast("Connect an account for this provider first","err"); return null; }
+    return kp;
   }
 
   function applyPickedModel(chosen){
@@ -2007,10 +2455,12 @@ function openRouteModal(route,opts){
     var da=dialAuth(); var e=catEntry(ps.value); var sug=suggestedModels(e,ts.value);
     if(sug.length){ pickModelModal(sug, applyPickedModel); return; }
     if(!url.value.trim()){ toast("Enter a Base URL first","err"); return; }
-    if(da.auth!=="none" && !pk.value.trim() && !catEntry(ps.value).key_set){ toast("Enter an API key, or choose Custom LLM for a no-auth local endpoint","err"); return; }
+    if(da.auth!=="none" && !pk.value.trim() && !catEntry(ps.value).key_set && !catEntry(ps.value).oauth){ toast("Enter an API key, or choose Custom LLM for a no-auth local endpoint","err"); return; }
+    var kp=keyPayloadOrFail();
+    if(!kp) return;
     loadBtn.disabled=true; loadBtn.textContent="Loading…";
     try{
-      var payload=Object.assign({base_url:url.value.trim(), protocol:da.dialect, auth_mode:da.auth}, keyPayload());
+      var payload=Object.assign({base_url:url.value.trim(), protocol:da.dialect, auth_mode:da.auth}, kp);
       var data=await api("/admin/routes/preview-models","POST",payload);
       if(!data.models || !data.models.length){ toast("No models returned — type the provider model name manually","err"); return; }
       pickModelModal(data.models, applyPickedModel);
@@ -2022,9 +2472,11 @@ function openRouteModal(route,opts){
     var da=dialAuth();
     if(!url.value.trim()){ toast("Enter a Base URL","err"); return; }
     if(!ms.value.trim()){ toast("Pick a provider model first","err"); return; }
+    var kp=keyPayloadOrFail();
+    if(!kp) return;
     testBtn.disabled=true; testBtn.textContent="Testing…"; setConnectionStatus("","Testing provider and selected model…");
     try{
-      var payload=Object.assign({base_url:url.value.trim(), dialect:da.dialect, auth_mode:da.auth, provider_model_name:ms.value.trim(), protocol:da.protocol}, keyPayload());
+      var payload=Object.assign({base_url:url.value.trim(), dialect:da.dialect, auth_mode:da.auth, provider_model_name:ms.value.trim(), protocol:da.protocol}, kp);
       var r=await api("/admin/test-connection","POST",payload);
       if(r.ok){
         var okMsg="Connected ("+r.latency_ms+" ms)"+(r.detail?" · "+r.detail:(r.model_ok===true?" · model OK":(r.model_ok===false?" · model rejected":"")));
@@ -2093,10 +2545,19 @@ function openRouteModal(route,opts){
         }
         payload={model_name:name,backend_ids:[singleBackendId],chars_per_token:4.0,first_byte_timeout:Number(to.value)||180,provider_model_name:modelSel,enabled:enabledFlag};
         payload.auth_mode=da.auth; payload.protocol=da.protocol;
-        // On edit the provider key is write-only (the input is blank); only send a key when the
-        // admin actually typed a new one. Otherwise the backend preserves the stored credential.
-        if(isEdit){ if(pk.value.trim()) payload.provider_key=pk.value.trim(); }
-        else { Object.assign(payload, keyPayload()); }
+        if(e.oauth){
+          // Unlike an API key, the reference is not write-only: the API rewrites
+          // `provider_key_ref` on every PATCH, so omitting it here would null the column and the
+          // database would reject the save (an OAuth route must point at a renewable credential).
+          var kp=keyPayloadOrFail();
+          if(!kp){ save.disabled=false; saveDisabled.disabled=false; updateSaveEnabled(); return; }
+          Object.assign(payload,kp);
+        }else if(isEdit){
+          // On edit the provider key is write-only (the input is blank); only send a key when the
+          // admin actually typed a new one. Otherwise the backend preserves the stored credential.
+          if(pk.value.trim()) payload.provider_key=pk.value.trim();
+        }
+        else { Object.assign(payload, keyPayloadOrFail()||{}); }
         if(fb.value) payload.fallback_backend_id=Number(fb.value);
       }
       if(ct.value) payload.context_tokens=Number(ct.value);
@@ -2117,7 +2578,10 @@ function openRouteModal(route,opts){
     var rb=backends.find(function(x){return x.id===(route.backend_ids&&route.backend_ids[0]);});
     if(rb){
       url.value=rb.base_url;
-      var ck=(catalog||[]).find(function(e){return rb.name===e.label || rb.name.toLowerCase().indexOf(e.key)>=0;});
+      /* An OAuth route's provider is authoritative from its credential reference. A name match on
+         the backend is only a guess, and guessing wrong would offer the API-key field for a route
+         whose credential cannot be pasted — and then null the reference on save. */
+      var ck=storedOauthRef ? null : (catalog||[]).find(function(e){return rb.name===e.label || rb.name.toLowerCase().indexOf(e.key)>=0;});
       if(ck){ ps.value=ck.key; applyCat(false); }
     }
     if(routeMode==="group" && groupEndpoints.length){
@@ -2840,9 +3304,26 @@ function copyText(text,label){
 }
 function copyIconBtn(text){ var b=el("button","btn sm ghost icon-btn"); b.title="Copy"; b.setAttribute("aria-label","Copy"); b.dataset.copy=text; b.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>'; b.onclick=function(){copyText(text,"Copied");}; return b; }
 function copyKeyBtn(text){ var b=copyIconBtn(text); b.classList.add("copy-key-btn"); b.title="Copy API key"; b.setAttribute("aria-label","Copy API key"); b.appendChild(el("span",null,"Copy key")); return b; }
-function protoLabel(p){ var m={"openai_chat":"OpenAI Chat Completions","openai_responses":"OpenAI Responses","openai_completions":"OpenAI Completions","openai_embeddings":"Embeddings","openai_rerank":"OpenAI Rerank","qwen_rerank":"Qwen Rerank","cohere_rerank":"Cohere Rerank","voyage_rerank":"Voyage Rerank","jina_rerank":"Jina Rerank","openai_audio_transcriptions":"Audio Transcriptions","systemone":"System One","anthropic_messages":"Anthropic Messages","local_openai_chat":"Local Chat","custom_openai_chat":"Custom LLM"}; return m[p]||p||"openai_chat"; }
-var PROTOCOLS=[["openai_chat","OpenAI Chat Completions"],["openai_responses","OpenAI Responses"],["openai_completions","OpenAI Completions"],["openai_embeddings","OpenAI Embeddings"],["openai_rerank","OpenAI-compatible Rerank"],["qwen_rerank","Qwen/DashScope Rerank"],["cohere_rerank","Cohere Rerank"],["voyage_rerank","Voyage Rerank"],["jina_rerank","Jina Rerank"],["openai_audio_transcriptions","OpenAI-compatible Audio Transcriptions"],["systemone","System One Decisions"],["anthropic_messages","Anthropic Messages"],["local_openai_chat","Local OpenAI-compatible Chat"],["custom_openai_chat","Custom LLM"]];
-function catEntry(key){ return (catalog||[]).find(function(e){return e.key===key;}) || {key:key,label:key,base_url:"",dialect:"openai",key_env:"",key_set:false}; }
+function protoLabel(p){ var m={"openai_chat":"OpenAI Chat Completions","openai_responses":"OpenAI Responses","openai_completions":"OpenAI Completions","openai_embeddings":"Embeddings","openai_rerank":"OpenAI Rerank","qwen_rerank":"Qwen Rerank","cohere_rerank":"Cohere Rerank","voyage_rerank":"Voyage Rerank","jina_rerank":"Jina Rerank","openai_audio_transcriptions":"Audio Transcriptions","systemone":"System One","anthropic_messages":"Anthropic Messages","codex_responses":"OpenAI Responses (Codex)","local_openai_chat":"Local Chat","custom_openai_chat":"Custom LLM"}; return m[p]||p||"openai_chat"; }
+var PROTOCOLS=[["openai_chat","OpenAI Chat Completions"],["openai_responses","OpenAI Responses"],["openai_completions","OpenAI Completions"],["openai_embeddings","OpenAI Embeddings"],["openai_rerank","OpenAI-compatible Rerank"],["qwen_rerank","Qwen/DashScope Rerank"],["cohere_rerank","Cohere Rerank"],["voyage_rerank","Voyage Rerank"],["jina_rerank","Jina Rerank"],["openai_audio_transcriptions","OpenAI-compatible Audio Transcriptions"],["systemone","System One Decisions"],["anthropic_messages","Anthropic Messages"],["codex_responses","OpenAI Responses (Codex)"],["local_openai_chat","Local OpenAI-compatible Chat"],["custom_openai_chat","Custom LLM"]];
+/* OAuth credentials only serve the tasks each provider's subscription actually exposes.
+   Guessing here would let an operator save a route that can only ever fail. */
+function oauthTaskSupported(providerKey,task){
+  var k=(providerKey||"").toLowerCase();
+  if(k==="claude-code") return task==="chat";
+  if(k==="codex") return task==="responses";
+  if(k==="xai-oauth") return task==="chat"||task==="responses";
+  return task==="chat"||task==="responses";
+}
+function catEntry(key){
+  var e=(catalog||[]).find(function(x){return x.key===key;});
+  if(e) return e;
+  // An OAuth preset the admin API knows about but the catalog did not list (a build upgraded
+  // without an .env edit) must still resolve, so the wizard does not fall back to an API-key field.
+  var o=oauthSpec(key);
+  if(o) return {key:key,label:o.label,base_url:o.api_base_url,dialect:(o.auth_mode==="anthropic_oauth"?"anthropic":"openai"),key_env:"",key_set:false,oauth:true,oauth_flow:o.flow,oauth_auth_mode:o.auth_mode,oauth_risk_note:o.risk_note};
+  return {key:key,label:key,base_url:"",dialect:"openai",key_env:"",key_set:false};
+}
 function isLocalUrl(u){ var h=(u||"").toLowerCase(); h=h.split("://")[1]||h; h=h.split("/")[0].split(":")[0]; return h==="127.0.0.1"||h==="localhost"||h==="::1"||h.startsWith("10.")||h.startsWith("192.168.")||h.startsWith("172.16.")||h.startsWith("172.17.")||h.startsWith("172.18.")||h.startsWith("172.19.")||/^172\.(2[0-9]|3[0-1])\./.test(h); }
 
 function logsTable(rows){

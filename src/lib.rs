@@ -9,5 +9,7 @@ pub mod contract;
 pub mod handlers;
 pub mod ledger;
 pub mod metrics;
+pub mod oauth;
+pub mod provider_auth;
 pub mod proxy;
 pub mod route;

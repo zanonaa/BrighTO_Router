@@ -17,6 +17,7 @@ use brighto_router::contract::{AppState, ConfigSnapshot};
 use brighto_router::handlers;
 use brighto_router::ledger::{LedgerSink, LedgerWriter};
 use brighto_router::metrics::Metrics;
+use brighto_router::oauth::refresh;
 use brighto_router::route::RamBackendPool;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8090";
@@ -190,6 +191,21 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
     backends
         .clone()
         .start_health_loop(client.clone(), Duration::from_secs(HEALTH_INTERVAL_SECS));
+
+    // OAuth token refresh: off the request path, same shape as the health loop. Fires
+    // `reload_notify` after a successful write so the config loader picks up the new access
+    // token immediately rather than on its next 5s tick.
+    //
+    // Started unconditionally and harmlessly idle when no OAuth account is connected, so an
+    // operator can connect one through the Portal on a running container without a restart.
+    let oauth_store = Arc::new(brighto_router::oauth::OAuthTokenStore::from_env());
+    let oauth_notify = reload_notify.clone();
+    refresh::spawn_refresh_loop(
+        oauth_store,
+        client.clone(),
+        Duration::from_secs(refresh::DEFAULT_REFRESH_INTERVAL_SECS),
+        Arc::new(move || oauth_notify.notify_one()),
+    );
 
     // Ledger: hot path -> LedgerSink; writer nền -> DB batch / file fallback.
     let (primary_tx, primary_rx) = mpsc::channel(8192);
