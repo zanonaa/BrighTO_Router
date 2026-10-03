@@ -1,0 +1,118 @@
+name: Release binaries
+
+# Builds self-contained release tarballs for linux/amd64 and linux/arm64 and attaches
+# them to a GitHub Release when a v* tag is pushed. Manual runs (workflow_dispatch)
+# build and upload workflow artifacts only, so the ARM runner path can be exercised
+# without cutting a release.
+#
+# The tarball carries the binary plus migrations/: the server applies no migrations
+# itself (that is start.sh's job, from the repo checkout), so a binary-only download
+# has to ship the SQL for the psql path documented in the tarball's README.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners on both architectures: the crate graph builds aws-lc-rs
+          # (C/CMake), and building natively beats emulating a 50 MB Rust binary
+          # under QEMU by an order of magnitude.
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Build
+        run: cargo build --release --locked --bin brighto-router
+
+      - name: Sanity-check the architecture
+        # `file` is the cheapest guard against a matrix row quietly building for the
+        # wrong machine. The release name promises an architecture; verify it.
+        run: |
+          file target/release/brighto-router
+          case "${{ matrix.arch }}" in
+            amd64) file target/release/brighto-router | grep -q "x86-64" ;;
+            arm64) file target/release/brighto-router | grep -q "aarch64" ;;
+          esac
+
+      - name: Strip
+        run: strip target/release/brighto-router
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          stage="stage/brighto-router"
+          mkdir -p "$stage/migrations"
+          cp target/release/brighto-router "$stage/"
+          cp migrations/*.sql "$stage/migrations/"
+          cat > "$stage/README.txt" <<'EOF'
+          BrighTO-Router release tarball (linux)
+
+          Contents:
+            brighto-router   release binary; the admin Portal is embedded, no static/ needed
+            migrations/      SQL migrations, applied in filename order
+
+          Install:
+            1) Have a PostgreSQL 14+ database and psql.
+            2) Apply migrations, in order:
+                 for f in migrations/*.sql; do
+                   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+                 done
+            3) Run the router (env vars as in the repository README):
+                 DATABASE_URL=... ADMIN_MASTER_KEY=... DATA_DIR=... ./brighto-router
+          EOF
+          tar -C stage -czf "brighto-router-${VERSION}-linux-${{ matrix.arch }}.tar.gz" brighto-router
+          ls -lh "brighto-router-${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: brighto-router-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # Manual runs stop at artifacts; only a real tag publishes.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download both architectures
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          ls -lh
+          sha256sum *.tar.gz > SHA256SUMS
+          # First run creates the release; a re-run of this job uploads over it.
+          gh release create "$GITHUB_REF_NAME" . \
+            --title "BrighTO-Router $GITHUB_REF_NAME" \
+            --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" . --clobber
