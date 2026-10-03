@@ -55,6 +55,18 @@ pub const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.0.0 (external, cli)";
 /// `chatgpt_account_id` (or `access_token.organizations[0].id`) at exchange time.
 pub const CODEX_ACCOUNT_HEADER: &str = "chatgpt-account-id";
 
+/// Header `cli-chat-proxy.grok.com` reads the client version from. The gate sits behind
+/// authentication, so it cannot be probed unauthenticated, and it reads exactly this header:
+/// `User-Agent`, `x-cli-version`, `x-client-version`, `x-grok-cli-version` and friends all parse
+/// as version `(none)` and the request dies with HTTP 426.
+pub const XAI_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
+
+/// Version floor advertised on SuperGrok/X Premium+ OAuth (Grok CLI subscription) requests.
+/// Verified against the live proxy: `1.0.13` returns 200 while omitting the header returns
+/// `426 Your Grok CLI version (none) is outdated. Please update to version 1.0.13 or later`.
+/// When xAI raises the floor, the 426 body names the new minimum — bump this constant.
+pub const XAI_GROK_CLIENT_VERSION: &str = "1.0.13";
+
 /// Static headers required by an OAuth credential type.
 pub fn oauth_static_headers(auth_mode: &str) -> &'static [(&'static str, &'static str)] {
     if auth_mode.eq_ignore_ascii_case(OAUTH_AUTH_MODE_ANTHROPIC) {
@@ -62,6 +74,8 @@ pub fn oauth_static_headers(auth_mode: &str) -> &'static [(&'static str, &'stati
             ("anthropic-beta", CLAUDE_OAUTH_BETA),
             ("user-agent", CLAUDE_OAUTH_USER_AGENT),
         ]
+    } else if auth_mode.eq_ignore_ascii_case(OAUTH_AUTH_MODE_XAI) {
+        &[(XAI_CLIENT_VERSION_HEADER, XAI_GROK_CLIENT_VERSION)]
     } else {
         &[]
     }
@@ -380,11 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn xai_oauth_ignores_backend_template_and_account_id() {
+    fn xai_oauth_ignores_backend_template_and_carries_client_version() {
         let p = resolve(OAUTH_AUTH_MODE_XAI, true, Some("acct"));
         assert_eq!(p.mode, HeaderMode::Bearer);
         assert!(p.account_id.is_none());
-        assert!(p.extra_headers.is_empty());
+        assert_eq!(
+            p.extra_headers,
+            &[(XAI_CLIENT_VERSION_HEADER, XAI_GROK_CLIENT_VERSION)]
+        );
+        // Case-insensitive like every auth mode comparison, and no other OAuth mode leaks the
+        // Grok header.
+        assert_eq!(
+            oauth_static_headers("XAI_OAUTH"),
+            &[(XAI_CLIENT_VERSION_HEADER, XAI_GROK_CLIENT_VERSION)]
+        );
+        assert!(oauth_static_headers(OAUTH_AUTH_MODE_CHATGPT).is_empty());
     }
 
     #[test]
