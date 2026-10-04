@@ -401,7 +401,8 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 /// `/v1/models` liệt kê route đang bật, hợp nhất với catalog động của các backend dynamic_models
 /// có ít nhất một route passthrough đang bật (bare id, không prefix; route thắng khi trùng tên).
-/// Route disabled không được quảng bá cho client.
+/// Route disabled không được quảng bá cho client; tên placeholder của route passthrough cũng
+/// không — model thật nằm trong catalog của backend.
 fn models_list_payload(
     routes: &HashMap<String, ModelRoute>,
     backends: &HashMap<i64, Backend>,
@@ -409,7 +410,9 @@ fn models_list_payload(
 ) -> serde_json::Value {
     let mut ids: Vec<String> = routes
         .iter()
-        .filter(|(_, route)| route.enabled)
+        // Passthrough routes carry no model of their own — their backend's catalog
+        // provides the real ids below.
+        .filter(|(_, route)| route.enabled && !route.passthrough)
         .map(|(model, _)| model.clone())
         .collect();
     let mut passthrough_backend_ids: Vec<i64> = routes
