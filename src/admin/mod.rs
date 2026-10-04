@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod combo_api;
 pub mod oauth_api;
 pub mod quota_api;
 
@@ -315,6 +316,7 @@ pub fn router(runtime: Arc<AppState>) -> Router {
         .route("/provider-catalog", get(list_provider_catalog))
         .route("/providers", get(list_providers))
         .route("/test-connection", post(test_connection))
+        .merge(combo_api::routes())
         .merge(oauth_api::routes())
         .merge(quota_api::routes())
         .route(
