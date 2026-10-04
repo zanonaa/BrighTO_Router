@@ -186,6 +186,7 @@ async fn build_translated_route_state(
         max_body_bytes: 10 * 1024 * 1024,
         quota: Arc::new(brighto_router::quota::QuotaStore::new()),
         reload_notify: Arc::new(tokio::sync::Notify::new()),
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,

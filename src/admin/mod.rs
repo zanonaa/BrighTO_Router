@@ -2468,15 +2468,16 @@ fn protocol_family(protocol: &str) -> &'static str {
     }
 }
 
-/// Cross-family endpoints a Model Group may hold. Same family always works; the single translated
-/// cross today is a chat-family route with a Responses-family endpoint (the proxy translates the
-/// request chat -> responses upstream and the answer back). Every other cross — including the
-/// reverse direction — is rejected until a translator exists for it.
+/// Cross-family endpoints a Model Group may hold. Same family always works; the two translated
+/// crosses are chat route × Responses endpoint and the reverse, Responses route × chat endpoint
+/// (the proxy translates the request upstream and the answer back in both directions). Every
+/// other cross is rejected until a translator exists for it.
 fn endpoint_family_allowed(route_protocol: &str, endpoint_protocol: &str) -> bool {
     let route_family = protocol_family(route_protocol);
     let endpoint_family = protocol_family(endpoint_protocol);
     route_family == endpoint_family
         || (route_family == "openai_chat" && endpoint_family == "openai_responses")
+        || (route_family == "openai_responses" && endpoint_family == "openai_chat")
 }
 
 fn validate_key_ref(value: &str) -> Result<String, ApiError> {
@@ -2777,9 +2778,10 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                         StatusCode::BAD_REQUEST,
                         format!(
                             "endpoint protocol {endpoint_protocol} is not compatible with group \
-                             protocol {protocol}: only a chat route holding responses-family \
-                             endpoints (openai_responses, codex_responses) is translated today; \
-                             this cross-family combination is not supported yet"
+                             protocol {protocol}: only the chat <-> responses pair is translated \
+                             today (a chat route holding responses-family endpoints, or a \
+                             responses route holding chat-family endpoints); this cross-family \
+                             combination is not supported yet"
                         ),
                     ));
                 }
@@ -4578,7 +4580,7 @@ mod tests {
     }
 
     #[test]
-    fn model_group_allows_only_the_translated_chat_to_responses_cross() {
+    fn model_group_allows_only_the_translated_chat_responses_pair() {
         // Same family always allowed.
         assert!(endpoint_family_allowed("openai_chat", "openai_chat"));
         assert!(endpoint_family_allowed("openai_chat", "local_openai_chat"));
@@ -4591,7 +4593,7 @@ mod tests {
             "openai_responses"
         ));
         assert!(endpoint_family_allowed("systemone", "systemone"));
-        // The one translated cross: a chat-family route may hold Responses-family endpoints
+        // Translated cross #1: a chat-family route may hold Responses-family endpoints
         // (openai_responses and the ChatGPT Codex variant).
         assert!(endpoint_family_allowed("openai_chat", "openai_responses"));
         assert!(endpoint_family_allowed("openai_chat", "codex_responses"));
@@ -4599,9 +4601,14 @@ mod tests {
             "custom_openai_chat",
             "codex_responses"
         ));
-        // The reverse direction has no translator yet.
-        assert!(!endpoint_family_allowed("openai_responses", "openai_chat"));
-        assert!(!endpoint_family_allowed(
+        // Translated cross #2, the reverse: a Responses-family route may hold chat-family
+        // endpoints (glm/deepseek/dahl/opencode-free style providers).
+        assert!(endpoint_family_allowed("openai_responses", "openai_chat"));
+        assert!(endpoint_family_allowed(
+            "openai_responses",
+            "custom_openai_chat"
+        ));
+        assert!(endpoint_family_allowed(
             "codex_responses",
             "local_openai_chat"
         ));
@@ -4618,6 +4625,10 @@ mod tests {
         assert!(!endpoint_family_allowed(
             "openai_responses",
             "openai_completions"
+        ));
+        assert!(!endpoint_family_allowed(
+            "openai_responses",
+            "anthropic_messages"
         ));
         assert!(!endpoint_family_allowed(
             "anthropic_messages",

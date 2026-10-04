@@ -11,9 +11,10 @@
 //!   (`responses_sse_to_chat_chunks`, incrementally through `ResponsesSseToChat`) or a single JSON
 //!   body (`responses_json_to_chat_completion`).
 //!
-//! Deliberately out of scope: the reverse direction (Responses client -> chat provider), the
-//! Anthropic dialect, and every chat field with no Responses equivalent (`n`, `logprobs`,
-//! `frequency_penalty`, ... are dropped rather than approximated). See ADAPTERS.md.
+//! Deliberately out of scope: the Anthropic dialect, and every chat field with no Responses
+//! equivalent (`n`, `logprobs`, `frequency_penalty`, ... are dropped rather than approximated).
+//! The reverse direction (Responses client -> chat provider) lives in the same module below —
+//! see `responses_request_to_chat` and `ChatSseToResponses`. See ADAPTERS.md.
 //!
 //! This module is pure like `opencode_free`: no I/O, no clock, no globals. It owns protocol shape
 //! only — routing, retries, credentials, budget, and the ledger stay in the proxy.
@@ -47,9 +48,9 @@ fn is_responses_family(protocol: ProviderProtocol) -> bool {
 
 /// True when this request must be translated chat -> responses on the wire.
 ///
-/// Only one direction exists. Every other pair (responses route with a chat endpoint, a chat route
-/// with a rerank endpoint, ...) must never reach the wire: the admin validation rejects it and the
-/// proxy has no lane for it.
+/// The mirror image (`responses_to_chat_applies`) covers a Responses route onto a chat endpoint.
+/// Every other pair (a chat route with a rerank endpoint, ...) must never reach the wire: the
+/// admin validation rejects it and the proxy has no lane for it.
 pub fn chat_to_responses_applies(
     route_protocol: ProviderProtocol,
     endpoint_protocol: ProviderProtocol,
@@ -719,6 +720,505 @@ pub fn responses_json_to_chat_completion(body: &[u8], client_model: &str) -> Opt
     Some(Value::Object(out))
 }
 
+/// Upstream path for Responses clients translated onto chat-family endpoints.
+pub const CHAT_UPSTREAM_PATH: &str = "/v1/chat/completions";
+
+/// The symmetric mismatch: a Responses-family client route onto a chat-family provider.
+pub fn responses_to_chat_applies(
+    route_protocol: ProviderProtocol,
+    endpoint_protocol: ProviderProtocol,
+) -> bool {
+    is_responses_family(route_protocol) && is_chat_family(endpoint_protocol)
+}
+
+fn responses_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                )
+            })
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// Responses request -> chat request. Only text and function tools are supported; server-side
+/// conversation state, storage, built-in tools and other Responses-only fields are not forwarded.
+/// The provider model is written here, never rewritten a second time by the proxy.
+pub fn responses_request_to_chat(body: &[u8], provider_model: &str) -> Option<Vec<u8>> {
+    let response: Value = serde_json::from_slice(body).ok()?;
+    let response = response.as_object()?;
+    let mut out = Map::new();
+    out.insert("model".into(), Value::from(provider_model));
+    let mut messages = Vec::new();
+    if let Some(instructions) = response.get("instructions").and_then(Value::as_str) {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    if let Some(input) = response.get("input").and_then(Value::as_str) {
+        messages.push(json!({"role": "user", "content": input}));
+    } else {
+        for item in array_of(response.get("input")) {
+            match item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+            {
+                "function_call" => {
+                    let Some(name) = item.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let call = json!({
+                        "id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+                        "type": "function",
+                        "function": {"name": name, "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or_default()}
+                    });
+                    // Adjacent calls belong to one assistant turn, not separate turns. Merge with
+                    // adjacent assistant text too, matching the inverse mapper's item ordering.
+                    if let Some(last) = messages.last_mut()
+                        && last.get("role").and_then(Value::as_str) == Some("assistant")
+                    {
+                        let calls = last
+                            .as_object_mut()?
+                            .entry("tool_calls")
+                            .or_insert(json!([]));
+                        calls.as_array_mut()?.push(call);
+                    } else {
+                        messages.push(
+                            json!({"role": "assistant", "content": null, "tool_calls": [call]}),
+                        );
+                    }
+                }
+                "function_call_output" => messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+                    "content": responses_text(item.get("output")),
+                })),
+                "message" => {
+                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                    if matches!(role, "user" | "assistant" | "system" | "developer") {
+                        messages.push(
+                            json!({"role": role, "content": responses_text(item.get("content"))}),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.insert("messages".into(), Value::Array(messages));
+    let tools: Vec<Value> = array_of(response.get("tools"))
+        .iter()
+        .filter_map(|tool| {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                return None;
+            }
+            let name = tool.get("name")?.as_str()?;
+            let mut function = Map::new();
+            function.insert("name".into(), Value::from(name));
+            for key in ["description", "parameters"] {
+                if let Some(value) = tool.get(key) {
+                    function.insert(key.into(), value.clone());
+                }
+            }
+            Some(json!({"type": "function", "function": function}))
+        })
+        .collect();
+    if !tools.is_empty() {
+        out.insert("tools".into(), Value::Array(tools));
+    }
+    match response.get("tool_choice") {
+        Some(Value::String(choice)) if matches!(choice.as_str(), "auto" | "none" | "required") => {
+            out.insert("tool_choice".into(), Value::from(choice.clone()));
+        }
+        Some(choice) if choice.get("type").and_then(Value::as_str) == Some("function") => {
+            if let Some(name) = choice.get("name").and_then(Value::as_str) {
+                out.insert(
+                    "tool_choice".into(),
+                    json!({"type": "function", "function": {"name": name}}),
+                );
+            }
+        }
+        _ => {}
+    }
+    if let Some(tokens) = response.get("max_output_tokens") {
+        out.insert("max_tokens".into(), tokens.clone());
+    }
+    if let Some(effort) = response.get("reasoning").and_then(|r| r.get("effort")) {
+        out.insert("reasoning_effort".into(), effort.clone());
+    }
+    for key in ["temperature", "top_p", "stop", "stream"] {
+        if let Some(value) = response.get(key) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    if out.get("stream") == Some(&Value::Bool(true)) {
+        // Chat upstreams only report usage on the wire with this flag, and the terminal
+        // response.completed event needs that usage; native chat routes splice the same field.
+        out.insert("stream_options".into(), json!({"include_usage": true}));
+    }
+    serde_json::to_vec(&Value::Object(out)).ok()
+}
+
+fn responses_usage(usage: &Value) -> Option<Value> {
+    let chat = chat_usage(usage)?;
+    Some(json!({
+        "input_tokens": chat["prompt_tokens"],
+        "output_tokens": chat["completion_tokens"],
+        "total_tokens": chat["total_tokens"],
+    }))
+}
+
+fn response_envelope(chat: &Value, client_model: &str, output: Vec<Value>, status: &str) -> Value {
+    let mut out =
+        json!({"object": "response", "model": client_model, "status": status, "output": output});
+    if let Some(id) = chat.get("id").filter(|v| !v.is_null()) {
+        out["id"] = id.clone();
+    }
+    if let Some(created) = chat.get("created").filter(|v| !v.is_null()) {
+        out["created_at"] = created.clone();
+    }
+    if let Some(usage) = chat.get("usage").and_then(responses_usage) {
+        out["usage"] = usage;
+    }
+    out
+}
+
+fn message_item(text: &str, id: &str, status: &str) -> Value {
+    json!({"id": id, "type": "message", "role": "assistant", "status": status,
+        "content": [{"type": "output_text", "text": text, "annotations": []}]})
+}
+
+/// Non-stream chat completion -> Responses JSON. The public model name replaces the provider's;
+/// a message item carries the text, `tool_calls` become `function_call` items, chat usage becomes
+/// Responses usage. Returns `None` when the body has no message to translate.
+pub fn chat_json_to_responses(body: &[u8], client_model: &str) -> Option<Value> {
+    let chat: Value = serde_json::from_slice(body).ok()?;
+    chat.as_object()?;
+    let message = chat.pointer("/choices/0/message")?.as_object()?;
+    let mut output = Vec::new();
+    if let Some(content) = message.get("content").filter(|v| !v.is_null()) {
+        output.push(message_item(
+            &chat_text(Some(content)),
+            "msg_0",
+            "completed",
+        ));
+    }
+    for (index, call) in array_of(message.get("tool_calls")).iter().enumerate() {
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            output.push(json!({"id": format!("fc_{index}"), "type": "function_call", "status": "completed",
+                "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(), "name": name,
+                "arguments": call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or_default()}));
+        }
+    }
+    Some(response_envelope(&chat, client_model, output, "completed"))
+}
+
+/// Incremental Chat SSE -> Responses SSE. Output items are indexed by first appearance; provider
+/// tool indexes are tracked separately so interleaved calls retain stable indexes. Names and
+/// arguments are additive fragments. Completion waits for the optional usage-only chunk after the
+/// finish_reason, or for [DONE]/EOF. A truncated turn without finish_reason never looks completed.
+/// Retained output plus any unfinished line is capped at 1 MiB, including streaming responses.
+pub struct ChatSseToResponses {
+    client_model: String,
+    meta: Value,
+    output: Vec<Value>,
+    tool_indexes: std::collections::BTreeMap<u64, usize>,
+    message_index: Option<usize>,
+    partial: Vec<u8>,
+    retained: usize,
+    sequence: u64,
+    started: bool,
+    finish_reason: Option<String>,
+    finished: bool,
+}
+
+impl ChatSseToResponses {
+    pub fn new(client_model: &str) -> Self {
+        Self {
+            client_model: client_model.into(),
+            meta: json!({}),
+            output: Vec::new(),
+            tool_indexes: Default::default(),
+            message_index: None,
+            partial: Vec::new(),
+            retained: 0,
+            sequence: 0,
+            started: false,
+            finish_reason: None,
+            finished: false,
+        }
+    }
+
+    fn event(&mut self, mut event: Value, out: &mut Vec<u8>) {
+        event["sequence_number"] = Value::from(self.sequence);
+        self.sequence += 1;
+        out.extend_from_slice(b"event: ");
+        out.extend_from_slice(event["type"].as_str().unwrap_or("error").as_bytes());
+        out.extend_from_slice(b"\ndata: ");
+        out.extend_from_slice(event.to_string().as_bytes());
+        out.extend_from_slice(b"\n\n");
+    }
+
+    fn fail_limit(&mut self, out: &mut Vec<u8>) {
+        self.finished = true;
+        self.partial.clear();
+        self.output.clear();
+        self.event(json!({"type": "error", "code": "server_error", "message": "chat translation exceeded the 1 MiB buffering limit"}), out);
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.finished {
+            return out;
+        }
+        // Consume lines without copying an arbitrarily large TCP chunk into partial.
+        for segment in chunk.split_inclusive(|b| *b == b'\n') {
+            if self
+                .retained
+                .saturating_add(self.partial.len())
+                .saturating_add(segment.len())
+                > 1024 * 1024
+            {
+                self.fail_limit(&mut out);
+                break;
+            }
+            self.partial.extend_from_slice(segment);
+            if segment.ends_with(b"\n") {
+                let line = std::mem::take(&mut self.partial);
+                self.push_line(line.trim_ascii_end(), &mut out);
+            }
+            if self.finished {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.partial.is_empty() && !self.finished {
+            let line = std::mem::take(&mut self.partial);
+            self.push_line(line.trim_ascii_end(), &mut out);
+        }
+        // EOF only completes the turn when the upstream actually finished it; a stream cut
+        // mid-generation must not look like a completed response.
+        if self.finish_reason.is_some() {
+            self.complete(&mut out);
+        }
+        out
+    }
+
+    /// Emit the closing events: per-item `done` frames plus the terminal event. `reason` picks the
+    /// terminal shape — `length` maps onto `response.incomplete`, mirroring how the chat direction
+    /// reads `incomplete_details.reason = max_output_tokens`.
+    fn complete(&mut self, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        for index in 0..self.output.len() {
+            self.output[index]["status"] = Value::from("completed");
+            let item = self.output[index].clone();
+            if item["type"] == "message" {
+                self.event(json!({"type": "response.output_text.done", "item_id": item["id"], "output_index": index, "content_index": 0, "text": item["content"][0]["text"]}), out);
+                self.event(json!({"type": "response.content_part.done", "item_id": item["id"], "output_index": index, "content_index": 0, "part": item["content"][0]}), out);
+            } else {
+                self.event(json!({"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": index, "arguments": item["arguments"], "name": item["name"]}), out);
+            }
+            self.event(
+                json!({"type": "response.output_item.done", "output_index": index, "item": item}),
+                out,
+            );
+        }
+        let incomplete = self.finish_reason.as_deref() == Some("length");
+        let status = if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let mut response = response_envelope(
+            &self.meta,
+            &self.client_model,
+            std::mem::take(&mut self.output),
+            status,
+        );
+        if incomplete {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        let event_type = if incomplete {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        self.event(json!({"type": event_type, "response": response}), out);
+    }
+
+    fn push_line(&mut self, line: &[u8], out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return;
+        };
+        let data = data.trim_ascii_start();
+        if data == b"[DONE]" {
+            self.complete(out);
+            return;
+        }
+        let Ok(chunk) = serde_json::from_slice::<Value>(data) else {
+            return;
+        };
+        if let Some(error) = chunk.get("error") {
+            self.finished = true;
+            self.event(json!({"type": "error", "error": error, "message": error.get("message").and_then(Value::as_str).unwrap_or("upstream chat request failed")}), out);
+            return;
+        }
+        if chunk.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+            return;
+        }
+        for key in ["id", "created", "usage"] {
+            if let Some(value) = chunk.get(key).filter(|v| !v.is_null()) {
+                self.meta[key] = value.clone();
+            }
+        }
+        if !self.started {
+            self.started = true;
+            let response =
+                response_envelope(&self.meta, &self.client_model, Vec::new(), "in_progress");
+            self.event(
+                json!({"type": "response.created", "response": response}),
+                out,
+            );
+        }
+        if let Some(choice) = array_of(chunk.get("choices"))
+            .iter()
+            .find(|c| c.get("index").and_then(Value::as_u64).unwrap_or(0) == 0)
+        {
+            let delta = &choice["delta"];
+            if let Some(text) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                self.retained += text.len();
+                let index = if let Some(index) = self.message_index {
+                    index
+                } else {
+                    let index = self.output.len();
+                    let id = format!("msg_{index}");
+                    let item = message_item("", &id, "in_progress");
+                    self.output.push(item.clone());
+                    self.message_index = Some(index);
+                    self.event(json!({"type": "response.output_item.added", "output_index": index, "item": item}), out);
+                    self.event(json!({"type": "response.content_part.added", "item_id": id, "output_index": index, "content_index": 0, "part": item["content"][0]}), out);
+                    index
+                };
+                let accumulated = self.output[index]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+                    + text;
+                self.output[index]["content"][0]["text"] = Value::from(accumulated);
+                self.event(json!({"type": "response.output_text.delta", "item_id": self.output[index]["id"], "output_index": index, "content_index": 0, "delta": text}), out);
+            }
+            for call in array_of(delta.get("tool_calls")) {
+                let provider_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let existing = self.tool_indexes.get(&provider_index).copied();
+                let index = existing.unwrap_or_else(|| {
+                    let index = self.output.len();
+                    self.output.push(json!({
+                        "id": format!("fc_{index}"), "type": "function_call",
+                        "status": "in_progress", "call_id": "", "name": "", "arguments": ""
+                    }));
+                    self.tool_indexes.insert(provider_index, index);
+                    index
+                });
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    self.retained += id.len();
+                    self.output[index]["call_id"] = Value::from(id);
+                }
+                for key in ["name", "arguments"] {
+                    if let Some(fragment) = call
+                        .get("function")
+                        .and_then(|f| f.get(key))
+                        .and_then(Value::as_str)
+                    {
+                        self.retained += fragment.len();
+                        let accumulated = self.output[index][key]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                            + fragment;
+                        self.output[index][key] = Value::from(accumulated);
+                        if key == "arguments" && existing.is_some() && !fragment.is_empty() {
+                            // Continuation fragments are announced as deltas; the opening fragment
+                            // rides on the output_item.added event instead.
+                            self.event(json!({"type": "response.function_call_arguments.delta", "item_id": self.output[index]["id"], "output_index": index, "delta": fragment}), out);
+                        }
+                    }
+                }
+                if existing.is_none() {
+                    // Announce with whatever the opening delta already carried (id, full name).
+                    self.event(json!({"type": "response.output_item.added", "output_index": index, "item": self.output[index]}), out);
+                }
+                // Count item overhead as well: a stream of empty calls must remain bounded.
+                self.retained += 128;
+            }
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+            {
+                self.finish_reason = Some(reason.to_string());
+            }
+        }
+        if self.retained > 1024 * 1024 {
+            self.fail_limit(out);
+            return;
+        }
+        // OpenAI-style upstreams send a usage-only chunk after finish_reason; providers that
+        // attach usage to the final choice chunk can complete right here. Otherwise [DONE] or
+        // EOF completes the turn.
+        if self.finish_reason.is_some()
+            && self.meta.get("usage").and_then(responses_usage).is_some()
+        {
+            self.complete(out);
+        }
+    }
+}
+
+/// Whole-body helper for fixtures and forced-SSE providers in the buffered translation lane.
+pub fn chat_sse_to_responses_events(sse: &[u8], client_model: &str) -> Option<String> {
+    let mut translator = ChatSseToResponses::new(client_model);
+    let mut out = translator.feed(sse);
+    out.extend_from_slice(&translator.finish());
+    (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Fold a chat SSE body into one Responses JSON object — the lane a non-streaming client takes
+/// when the chat upstream streams anyway. Returns `None` unless the stream reached a terminal
+/// event, so a truncated upstream answers 502 instead of a half-finished response.
+pub fn chat_sse_to_responses_json(sse: &[u8], client_model: &str) -> Option<Value> {
+    let events = chat_sse_to_responses_events(sse, client_model)?;
+    events
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .rfind(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete")
+            )
+        })
+        .and_then(|event| event.get("response").cloned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,7 +1289,7 @@ mod tests {
                 );
             }
         }
-        // The reverse direction does not exist yet.
+        // The reverse direction is decided by its own predicate, never this one.
         assert!(!chat_to_responses_applies(
             ProviderProtocol::OpenAiResponses,
             ProviderProtocol::OpenAiChat
@@ -1343,5 +1843,642 @@ mod tests {
             responses_json_to_chat_completion(b"{\"error\":{\"message\":\"x\"}}", "m").is_some()
         );
         assert!(responses_json_to_chat_completion(b"not json", "m").is_none());
+    }
+
+    // ===== reverse direction: Responses client -> chat provider =====
+
+    fn rev(body: &str, model: &str) -> Value {
+        let out = responses_request_to_chat(body.as_bytes(), model).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn roles_of(value: &Value) -> Vec<&str> {
+        value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn reverse_translation_triggers_only_for_responses_route_onto_chat_endpoint() {
+        for route in [
+            ProviderProtocol::OpenAiResponses,
+            ProviderProtocol::CodexResponses,
+        ] {
+            for chat in [
+                ProviderProtocol::OpenAiChat,
+                ProviderProtocol::LocalOpenAiChat,
+                ProviderProtocol::CustomOpenAiChat,
+            ] {
+                assert!(responses_to_chat_applies(route, chat));
+            }
+            for other in [
+                ProviderProtocol::OpenAiCompletions,
+                ProviderProtocol::OpenAiEmbeddings,
+                ProviderProtocol::OpenAiRerank,
+                ProviderProtocol::AnthropicMessages,
+                ProviderProtocol::SystemOne,
+                ProviderProtocol::OpenAiResponses,
+            ] {
+                assert!(
+                    !responses_to_chat_applies(route, other),
+                    "{route:?} -> {other:?} must stay untranslated"
+                );
+            }
+        }
+        // The forward direction belongs to the other predicate, never this one.
+        assert!(!responses_to_chat_applies(
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::OpenAiResponses
+        ));
+    }
+
+    #[test]
+    fn plain_responses_request_becomes_system_plus_user_messages() {
+        let out = rev(
+            r#"{"model":"public-rsp","instructions":"be terse","input":[
+                {"role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ],"store":false,"stream":false}"#,
+            "glm-4.7",
+        );
+        assert_eq!(out["model"], "glm-4.7", "endpoint model written directly");
+        assert_eq!(
+            roles_of(&out),
+            ["system", "user"],
+            "instructions become a leading system message"
+        );
+        assert_eq!(out["messages"][0]["content"], "be terse");
+        assert_eq!(out["messages"][1]["content"], "hello");
+        // Responses-only envelope fields must not survive.
+        for dropped in [
+            "instructions",
+            "input",
+            "store",
+            "previous_response_id",
+            "metadata",
+            "text",
+            "truncation",
+            "parallel_tool_calls",
+        ] {
+            assert!(
+                out.get(dropped).is_none(),
+                "{dropped} leaked into chat body"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_string_input_becomes_one_user_message() {
+        let out = rev(r#"{"input":"just asking"}"#, "m");
+        assert_eq!(roles_of(&out), ["user"]);
+        assert_eq!(out["messages"][0]["content"], "just asking");
+    }
+
+    #[test]
+    fn multi_turn_items_map_to_chat_messages() {
+        let out = rev(
+            r#"{"instructions":"sys","input":[
+                {"role":"user","content":[{"type":"input_text","text":"weather?"}]},
+                {"role":"assistant","content":[{"type":"output_text","text":"checking"}]},
+                {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Hanoi\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"31C"},
+                {"role":"user","content":[{"type":"input_text","text":"thanks"}]}
+            ]}"#,
+            "m",
+        );
+        assert_eq!(
+            roles_of(&out),
+            ["system", "user", "assistant", "tool", "user"]
+        );
+        // The adjacent assistant text and its function call are ONE chat turn.
+        let assistant = &out["messages"][2];
+        assert_eq!(assistant["content"], "checking");
+        let call = &assistant["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], "{\"city\":\"Hanoi\"}");
+        assert_eq!(out["messages"][3]["tool_call_id"], "call_1");
+        assert_eq!(out["messages"][3]["content"], "31C");
+    }
+
+    #[test]
+    fn consecutive_function_calls_share_one_assistant_message() {
+        let out = rev(
+            r#"{"input":[
+                {"type":"function_call","call_id":"call_a","name":"f","arguments":"{}"},
+                {"type":"function_call","call_id":"call_b","name":"g","arguments":"[]"}
+            ]}"#,
+            "m",
+        );
+        assert_eq!(roles_of(&out), ["assistant"]);
+        assert_eq!(out["messages"][0]["content"], Value::Null);
+        assert_eq!(
+            out["messages"][0]["tool_calls"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(out["messages"][0]["tool_calls"][1]["id"], "call_b");
+    }
+
+    #[test]
+    fn system_and_developer_input_items_become_system_messages() {
+        let out = rev(
+            r#"{"input":[
+                {"role":"developer","content":"dev rules"},
+                {"role":"user","content":"hi"}
+            ]}"#,
+            "m",
+        );
+        assert_eq!(roles_of(&out), ["developer", "user"]);
+        assert_eq!(out["messages"][0]["content"], "dev rules");
+    }
+
+    #[test]
+    fn non_text_parts_are_dropped_from_content() {
+        let out = rev(
+            r#"{"input":[{"role":"user","content":[
+                {"type":"input_text","text":"see "},
+                {"type":"input_image","image_url":"data:image/png;base64,AAAA"},
+                {"type":"input_text","text":"this"}
+            ]}]}"#,
+            "m",
+        );
+        assert_eq!(out["messages"][0]["content"], "see this");
+    }
+
+    #[test]
+    fn tools_nest_and_tool_choice_maps_back() {
+        let out = rev(
+            r#"{"input":[],"tools":[
+                {"type":"function","name":"get_weather","description":"d","parameters":{"type":"object"}},
+                {"type":"function","name":"bare"}
+            ],"tool_choice":{"type":"function","name":"get_weather"}}"#,
+            "m",
+        );
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(out["tools"][0]["function"]["description"], "d");
+        assert_eq!(out["tools"][0]["function"]["parameters"]["type"], "object");
+        assert!(
+            out["tools"][0].get("name").is_none(),
+            "flat Responses spelling must be nested away"
+        );
+        // A tool without description/parameters keeps only the name.
+        assert_eq!(
+            out["tools"][1]["function"].as_object().unwrap().len(),
+            1,
+            "bare tool keeps name only"
+        );
+        assert_eq!(
+            out["tool_choice"],
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}})
+        );
+    }
+
+    #[test]
+    fn tool_choice_strings_pass_and_unknown_shapes_drop_reverse() {
+        for choice in ["auto", "none", "required"] {
+            let out = rev(
+                &format!(
+                    r#"{{"input":[],"tools":[{{"type":"function","name":"f"}}],"tool_choice":"{choice}"}}"#
+                ),
+                "m",
+            );
+            assert_eq!(out["tool_choice"], choice);
+        }
+        // Built-in tool types have no chat equivalent and are dropped entirely.
+        let out = rev(
+            r#"{"input":[],"tools":[{"type":"web_search"}],"tool_choice":{"type":"web_search"}}"#,
+            "m",
+        );
+        assert!(out.get("tools").is_none());
+        assert!(out.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn sampling_and_reasoning_fields_map_reverse() {
+        let out = rev(
+            r#"{"input":[],"max_output_tokens":128,"reasoning":{"effort":"high"},
+                "temperature":0.2,"top_p":0.9,"stop":["\n\n"]}"#,
+            "m",
+        );
+        assert_eq!(out["max_tokens"], 128);
+        assert!(out.get("max_output_tokens").is_none());
+        assert_eq!(out["reasoning_effort"], "high");
+        assert!(out.get("reasoning").is_none());
+        assert_eq!(out["temperature"], 0.2);
+        assert_eq!(out["top_p"], 0.9);
+        assert_eq!(out["stop"][0], "\n\n");
+
+        // reasoning without an effort carries nothing over.
+        let out = rev(r#"{"input":[],"reasoning":{"summary":"auto"}}"#, "m");
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn streaming_requests_ask_the_chat_upstream_for_usage() {
+        let out = rev(r#"{"input":"hi","stream":true}"#, "m");
+        assert_eq!(out["stream"], true);
+        assert_eq!(
+            out["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+
+        let out = rev(r#"{"input":"hi","stream":false}"#, "m");
+        assert_eq!(out["stream"], false);
+        assert!(out.get("stream_options").is_none());
+
+        let out = rev(r#"{"input":"hi"}"#, "m");
+        assert!(out.get("stream").is_none());
+        assert!(out.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn untranslatable_reverse_bodies_return_none() {
+        assert!(responses_request_to_chat(b"not json", "m").is_none());
+        assert!(responses_request_to_chat(b"[]", "m").is_none());
+        assert!(responses_request_to_chat(b"\"x\"", "m").is_none());
+    }
+
+    #[test]
+    fn reverse_direction_round_trips_through_the_forward_mapper() {
+        // responses -> chat -> responses must reproduce the same conversation skeleton.
+        let original = r#"{"instructions":"sys","input":[
+            {"role":"user","content":"weather?"},
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":"31C"}
+        ],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]}"#;
+        let chat = responses_request_to_chat(original.as_bytes(), "m").unwrap();
+        let back = chat_request_to_responses(&chat, &opts("m")).unwrap();
+        let back: Value = serde_json::from_slice(&back).unwrap();
+        assert_eq!(back["instructions"], "sys");
+        assert_eq!(
+            types_of(&back),
+            ["user", "function_call", "function_call_output"]
+        );
+        assert_eq!(back["input"][1]["name"], "get_weather");
+        assert_eq!(back["tools"][0]["name"], "get_weather");
+    }
+
+    // ===== reverse direction: chat upstream answers a Responses client =====
+
+    fn role_open_chunk() -> String {
+        "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.7\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n".to_string()
+    }
+
+    fn content_chunk(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.7\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n"
+        )
+    }
+
+    fn finish_chunk(reason: &str, usage: &str) -> String {
+        format!(
+            "data: {{\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.7\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]{usage}}}\n\n"
+        )
+    }
+
+    fn usage_chunk() -> String {
+        "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n".to_string()
+    }
+
+    /// Event payloads of a translated stream, in order.
+    fn rev_events(sse: &str) -> Vec<Value> {
+        chat_sse_to_responses_events(sse.as_bytes(), "public-rsp")
+            .expect("translatable stream")
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn reverse_stream_happy_path_emits_created_deltas_completed() {
+        let sse = format!(
+            "{}{}{}{}{}",
+            role_open_chunk(),
+            content_chunk("Hel"),
+            content_chunk("lo"),
+            finish_chunk("stop", ""),
+            "data: [DONE]\n\n"
+        );
+        let out = chat_sse_to_responses_events(sse.as_bytes(), "public-rsp").unwrap();
+        assert!(
+            !out.contains("[DONE]"),
+            "chat terminator is not Responses wire: {out}"
+        );
+        let events = rev_events(&sse);
+        assert_eq!(
+            types(&events),
+            [
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let created = &events[0]["response"];
+        assert_eq!(
+            created["id"], "chatcmpl-7",
+            "id preserved from the chat chunk"
+        );
+        assert_eq!(created["created_at"], 1_700_000_000u64);
+        assert_eq!(created["model"], "public-rsp", "client-facing name only");
+        assert_eq!(created["status"], "in_progress");
+        assert_eq!(events[3]["delta"], "Hel");
+        assert_eq!(events[4]["delta"], "lo");
+        let completed = &events.last().unwrap()["response"];
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["id"], "chatcmpl-7");
+        assert_eq!(completed["output"][0]["type"], "message");
+        assert_eq!(completed["output"][0]["content"][0]["text"], "Hello");
+        assert!(completed.get("usage").is_none(), "no usage was reported");
+        // sequence numbers are dense and increasing, like a real Responses stream.
+        let seqs: Vec<u64> = events
+            .iter()
+            .map(|e| e["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reverse_stream_waits_for_the_usage_chunk_before_completing() {
+        // OpenAI-style: finish_reason first, usage in its own trailing chunk.
+        let sse = format!(
+            "{}{}{}{}",
+            role_open_chunk(),
+            content_chunk("hi"),
+            finish_chunk("stop", ""),
+            usage_chunk()
+        );
+        let events = rev_events(&sse);
+        assert_eq!(types(&events).last().unwrap(), &"response.completed");
+        let usage = &events.last().unwrap()["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 18);
+        // No [DONE] was sent: completion came from finish_reason + usage, not the terminator.
+        assert!(!sse.is_empty());
+    }
+
+    #[test]
+    fn reverse_stream_completes_when_usage_rides_the_finish_chunk() {
+        // DeepSeek/GLM-style: usage attached to the chunk that carries finish_reason.
+        let sse = format!(
+            "{}{}",
+            content_chunk("ok"),
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\ndata: [DONE]\n\n"
+        );
+        let events = rev_events(&sse);
+        let last = events.last().unwrap();
+        assert_eq!(last["type"], "response.completed");
+        assert_eq!(last["response"]["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn reverse_stream_accumulates_tool_call_fragments_by_index() {
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"get_\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"weather\",\"arguments\":\"\\\"city\\\":\\\"Hanoi\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_8\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = rev_events(sse);
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.added")
+            .collect();
+        assert_eq!(added.len(), 2, "one added event per call");
+        assert_eq!(added[0]["item"]["type"], "function_call");
+        assert_eq!(added[0]["item"]["call_id"], "call_7");
+        let done: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["output_index"], 0);
+        assert_eq!(done[1]["output_index"], 1);
+        assert_eq!(
+            done[0]["item"]["name"], "get_weather",
+            "name fragments are concatenated"
+        );
+        assert_eq!(done[0]["item"]["arguments"], "{\"city\":\"Hanoi\"}");
+        assert_eq!(done[1]["item"]["call_id"], "call_8");
+        let completed = &events.last().unwrap()["response"];
+        assert_eq!(completed["output"].as_array().unwrap().len(), 2);
+        assert_eq!(completed["output"][0]["type"], "function_call");
+        assert_eq!(completed["output"][0]["name"], "get_weather");
+        assert_eq!(completed["output"][1]["name"], "ping");
+        assert_eq!(completed["usage"]["input_tokens"], 4);
+    }
+
+    #[test]
+    fn reverse_stream_length_finish_maps_to_incomplete() {
+        let sse = format!(
+            "{}{}{}",
+            content_chunk("part"),
+            finish_chunk("length", ""),
+            "data: [DONE]\n\n"
+        );
+        let events = rev_events(&sse);
+        let last = events.last().unwrap();
+        assert_eq!(last["type"], "response.incomplete");
+        assert_eq!(last["response"]["status"], "incomplete");
+        assert_eq!(
+            last["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
+
+    #[test]
+    fn reverse_stream_error_chunk_terminates_with_an_error_event() {
+        let sse = concat!(
+            "data: {\"error\":{\"message\":\"model capacity\",\"type\":\"server_error\",\"code\":\"503\"}}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n"
+        );
+        let events = rev_events(sse);
+        assert_eq!(types(&events), ["error"]);
+        assert_eq!(events[0]["message"], "model capacity");
+        assert_eq!(events[0]["error"]["code"], "503");
+    }
+
+    #[test]
+    fn reverse_stream_ignores_noise_frames_and_requires_a_real_chunk() {
+        // Comments, event lines, and JSON that is not a chat chunk produce nothing.
+        let noise = "event: ping\n: keep-alive\n\ndata: {\"type\":\"response.ping\"}\n\n";
+        assert!(
+            chat_sse_to_responses_events(noise.as_bytes(), "public-rsp").is_none(),
+            "no chunk means no events"
+        );
+
+        // Non-zero choice indexes are dropped, index 0 still works.
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"other\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"main\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"
+        );
+        let events = rev_events(sse);
+        let text: String = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "main");
+    }
+
+    #[test]
+    fn reverse_stream_truncated_without_finish_stops_silently() {
+        let sse = format!("{}{}", role_open_chunk(), content_chunk("half"));
+        let out = chat_sse_to_responses_events(sse.as_bytes(), "public-rsp").unwrap();
+        assert!(out.contains("\"delta\":\"half\""));
+        assert!(
+            !out.contains("response.completed"),
+            "an upstream cut mid-generation must not look finished"
+        );
+        assert!(
+            chat_sse_to_responses_json(sse.as_bytes(), "public-rsp").is_none(),
+            "the buffered fold answers nothing for a truncated stream"
+        );
+    }
+
+    #[test]
+    fn reverse_stream_survives_chunk_boundaries_splitting_a_frame() {
+        let sse = format!(
+            "{}{}{}{}",
+            role_open_chunk(),
+            content_chunk("He"),
+            content_chunk("y"),
+            finish_chunk("stop", "")
+        );
+        let mut translator = ChatSseToResponses::new("public-rsp");
+        let mut out = Vec::new();
+        for byte in sse.as_bytes() {
+            out.extend_from_slice(&translator.feed(&[*byte]));
+        }
+        out.extend_from_slice(&translator.finish());
+        let whole = chat_sse_to_responses_events(sse.as_bytes(), "public-rsp").unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), whole);
+    }
+
+    #[test]
+    fn reverse_stream_completes_exactly_once() {
+        let sse = format!(
+            "{}{}{}",
+            finish_chunk("stop", ""),
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+            content_chunk("after")
+        );
+        let out = chat_sse_to_responses_events(sse.as_bytes(), "public-rsp").unwrap();
+        assert_eq!(
+            out.matches("\"type\":\"response.completed\"").count(),
+            1,
+            "exactly one terminal event even with a duplicated [DONE]"
+        );
+        assert!(
+            !out.contains("\"after\""),
+            "frames after the terminator are not translated"
+        );
+    }
+
+    #[test]
+    fn reverse_stream_caps_runaway_translation_at_one_mebibyte() {
+        let fragment = format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+            "x".repeat(64 * 1024)
+        );
+        let mut translator = ChatSseToResponses::new("public-rsp");
+        let mut out = Vec::new();
+        for _ in 0..32 {
+            out.extend_from_slice(&translator.feed(fragment.as_bytes()));
+        }
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            text.contains("\"type\":\"error\""),
+            "the oversized stream must terminate with an error event"
+        );
+        assert!(
+            !text.contains("response.completed"),
+            "a runaway stream must not look completed"
+        );
+        // The translator is finished: further input changes nothing.
+        let more = translator.feed(fragment.as_bytes());
+        assert!(more.is_empty());
+    }
+
+    #[test]
+    fn reverse_nonstream_maps_text_and_usage_into_a_response_object() {
+        let body = br#"{"id":"chatcmpl-9","object":"chat.completion","created":1700000000,"model":"glm-4.7",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Hello there"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}"#;
+        let out = chat_json_to_responses(body, "public-rsp").unwrap();
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["id"], "chatcmpl-9");
+        assert_eq!(out["created_at"], 1_700_000_000u64);
+        assert_eq!(out["model"], "public-rsp", "client-facing name only");
+        assert_eq!(out["status"], "completed");
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["content"][0]["type"], "output_text");
+        assert_eq!(item["content"][0]["text"], "Hello there");
+        assert_eq!(out["usage"]["input_tokens"], 9);
+        assert_eq!(out["usage"]["output_tokens"], 4);
+        assert_eq!(out["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn reverse_nonstream_maps_tool_calls_without_a_message_item() {
+        let body = br#"{"id":"chatcmpl-10","created":1700000000,
+            "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Hanoi\"}"}}
+            ]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":6}}"#;
+        let out = chat_json_to_responses(body, "public-rsp").unwrap();
+        assert_eq!(out["output"].as_array().unwrap().len(), 1);
+        assert_eq!(out["output"][0]["type"], "function_call");
+        assert_eq!(out["output"][0]["call_id"], "call_1");
+        assert_eq!(out["output"][0]["name"], "get_weather");
+        assert_eq!(out["output"][0]["arguments"], "{\"city\":\"Hanoi\"}");
+        assert_eq!(
+            out["usage"]["total_tokens"], 11,
+            "total is summed when absent"
+        );
+    }
+
+    #[test]
+    fn reverse_nonstream_rejects_bodies_without_a_message() {
+        assert!(chat_json_to_responses(b"not json", "m").is_none());
+        assert!(chat_json_to_responses(b"[]", "m").is_none());
+        assert!(chat_json_to_responses(b"{\"error\":{\"message\":\"x\"}}", "m").is_none());
+    }
+
+    #[test]
+    fn reverse_fold_translates_a_whole_chat_stream_into_one_response() {
+        let sse = format!(
+            "{}{}{}{}{}",
+            role_open_chunk(),
+            content_chunk("Hel"),
+            content_chunk("lo"),
+            finish_chunk("stop", ""),
+            usage_chunk()
+        );
+        let out = chat_sse_to_responses_json(sse.as_bytes(), "public-rsp").unwrap();
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(out["usage"]["input_tokens"], 11);
+        assert_eq!(out["usage"]["output_tokens"], 7);
     }
 }
