@@ -95,16 +95,23 @@ A quota probe is part of the same row (`quota_probe`): path, query, any extra he
 response shape comes back. Leave it `None` and the account is passive-only — the Portal says so
 instead of showing a spinner.
 
-## Chat client -> Responses provider translation
+## Chat <-> Responses protocol translation
 
-The one supported cross-family pair: a **chat-family route** (`/v1/chat/completions`, route protocol
-`openai_chat`) whose Model Group holds a **Responses-family endpoint** (endpoint protocol
-`openai_responses` or `codex_responses`, including xAI Grok and Codex OAuth). The mismatch itself is
-the trigger — there is no config switch and no per-model override. When it holds, the router rewrites
-the request into a Responses request before it leaves and rewrites the answer back into OpenAI Chat
-shape, so an OpenAI Chat client keeps working unchanged.
+The two supported cross-family pairs — both directions of the same dialect bridge, with the
+mismatch itself as the trigger (no config switch, no per-model override):
 
-How each side is mapped:
+1. a **chat-family route** (`/v1/chat/completions`, route protocol `openai_chat`) whose Model
+   Group holds a **Responses-family endpoint** (endpoint protocol `openai_responses` or
+   `codex_responses`, including xAI Grok and Codex OAuth);
+2. a **Responses-family route** (`/v1/responses`, route protocol `openai_responses` or
+   `codex_responses`) whose Model Group holds a **chat-family endpoint** (`openai_chat`,
+   `local_openai_chat`, `custom_openai_chat` — glm/deepseek/dahl/opencode-free style providers).
+
+When either holds, the router rewrites the request into the endpoint's dialect before it leaves
+and rewrites the answer back into the route's dialect, so the client keeps working unchanged —
+and a mixed Model Group is fully usable from both families.
+
+How each side is mapped, chat client -> Responses provider:
 
 - **Request** (`chat_request_to_responses`): the first system message becomes top-level
   `instructions`; every other message becomes an `input` item with `input_text`/`output_text` parts;
@@ -120,24 +127,52 @@ How each side is mapped:
 - The upstream URL is always built on `/v1/responses`, so both SDK-style base URLs and Codex base
   URLs (`.../backend-api/codex`) work unchanged.
 
+And the mirror, Responses client -> chat provider:
+
+- **Request** (`responses_request_to_chat`): `instructions` become a leading `system` message;
+  `input` items become chat `messages` (user `input_text` parts concatenate into string content,
+  assistant `output_text` becomes an assistant message, `function_call` items become an assistant
+  message with `tool_calls` — consecutive calls and adjacent assistant text merge into one turn —
+  and `function_call_output` becomes a `tool` message with `tool_call_id`); a plain-string `input`
+  becomes one user message; flat Responses tools nest into chat's
+  `{type:"function",function:{...}}`; `tool_choice` maps back onto the nested form;
+  `max_output_tokens` becomes `max_tokens`; `reasoning.effort` becomes `reasoning_effort`;
+  `temperature`/`top_p`/`stop`/`stream` pass through; a streaming request gains
+  `stream_options:{include_usage:true}` so the terminal event can carry usage.
+- **Response** (`chat_json_to_responses`, `ChatSseToResponses`): a JSON `chat.completion` becomes
+  one Responses object (`object:"response"`, `status:"completed"`, a message item with
+  `output_text`, `function_call` items from `tool_calls`, `usage:{input_tokens,output_tokens,
+  total_tokens}`). A streamed answer becomes Responses events — `response.created` first, then
+  `response.output_item.added`/`response.output_text.delta` per content fragment, tool-call deltas
+  accumulated by provider index into `function_call` items, and finally `response.completed`
+  carrying usage (a chat `finish_reason:"length"` becomes `response.incomplete` with
+  `incomplete_details.reason = max_output_tokens`). The chat `[DONE]` marker is never forwarded:
+  the Responses wire simply ends after the terminal event. Completion waits for the optional
+  usage-only chunk after `finish_reason` so OpenAI-style upstreams keep their usage.
+- The upstream URL is always built on `/v1/chat/completions`, whatever `/v1`-prefixed base URL the
+  chat backend declares.
+
 Limits, deliberate and validated:
 
-- **One direction only.** A Responses-family route with a chat endpoint, and every other cross, is
-  rejected by admin validation with a "not supported yet" message — the Portal route/group editor is
-  the same validation.
-- Chat fields with no Responses equivalent are **dropped, not approximated**: `n`, `logprobs`,
-  `frequency_penalty`, `presence_penalty`, `logit_bias`, `user`, `seed`, `parallel_tool_calls`,
-  `response_format`, and `stream_options`.
-- Multimodal chat parts (`image_url`, `input_audio`, ...) are dropped from text extraction; this
-  adapter is text-only.
-- Translated requests take the buffered path (never a streaming upload), and the fold-back lane caps
-  upstream bodies at 1 MiB.
+- **Only this pair.** Every other cross (a Responses route with an embeddings endpoint, a chat
+  route with a rerank endpoint, anything Anthropic, ...) is rejected by admin validation with a
+  "not supported yet" message — the Portal route/group editor is the same validation.
+- Fields with no equivalent in the target dialect are **dropped, not approximated**: chat `n`,
+  `logprobs`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `user`, `seed`,
+  `parallel_tool_calls`, `response_format`, and `stream_options` (in that direction); Responses
+  `store`, `previous_response_id` (server-side conversation state is not reconstructed),
+  `metadata`, `text`, `truncation`, built-in tools (`web_search`, ...), and multimodal parts.
+  Both adapters are text-only.
+- Translated requests take the buffered path (never a streaming upload), the fold-back lane caps
+  upstream bodies at 1 MiB, and the streaming Responses translator caps its retained state at
+  1 MiB (a runaway stream terminates with an `error` event instead of exhausting memory).
 - Upstream error bodies pass through untranslated — an error is already provider-shaped diagnostics,
   not a completion.
 
-The pure mapping lives in `src/translate_chat_responses.rs` (unit-tested in place); routing, retries,
-credentials, budget, and the ledger are untouched proxy concerns. `tests/translator_chat_responses.rs`
-drives the full path against in-test mock Responses upstreams.
+The pure mapping lives in `src/translate_chat_responses.rs` (unit-tested in place); routing,
+retries, credentials, budget, and the ledger are untouched proxy concerns.
+`tests/translator_chat_responses.rs` and `tests/translator_responses_chat.rs` drive both full
+paths against in-test mock upstreams.
 
 ## Quota smoke
 

@@ -477,7 +477,10 @@ fn parse_openai_usage_from_line(line: &[u8]) -> Option<(u64, u64)> {
         return None;
     }
     let v: Value = serde_json::from_slice(data).ok()?;
-    let usage = v.get("usage")?;
+    // Chat chunks carry usage at the top level; Responses events nest it one level down under
+    // `response` (the translated lane emits exactly that shape, and so do passthrough Responses
+    // upstreams).
+    let usage = v.get("usage").or_else(|| v.pointer("/response/usage"))?;
     let pt = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))?
@@ -853,13 +856,38 @@ fn no_backend_body(reason: impl Into<String>) -> Response<Body> {
     )
 }
 
+/// Lane SSE translator the proxy pump drives: whichever direction the request was translated, the
+/// response bytes must be translated back incrementally.
+enum SseTranslator {
+    /// Upstream speaks Responses, the client speaks chat (chat route × Responses endpoint).
+    ResponsesToChat(crate::translate_chat_responses::ResponsesSseToChat),
+    /// Upstream speaks chat, the client speaks Responses (Responses route × chat endpoint).
+    ChatToResponses(crate::translate_chat_responses::ChatSseToResponses),
+}
+
+impl SseTranslator {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        match self {
+            Self::ResponsesToChat(translator) => translator.feed(chunk),
+            Self::ChatToResponses(translator) => translator.feed(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        match self {
+            Self::ResponsesToChat(translator) => translator.finish(),
+            Self::ChatToResponses(translator) => translator.finish(),
+        }
+    }
+}
+
 async fn forward_backend_response(
     response: reqwest::Response,
     format: BackendFormat,
     quota_key: Option<&crate::quota::QuotaKey>,
     quota_store: &crate::quota::QuotaStore,
     mut reporter: CompletionReporter,
-    translator: Option<crate::translate_chat_responses::ResponsesSseToChat>,
+    translator: Option<SseTranslator>,
 ) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -1362,6 +1390,109 @@ async fn translated_responses_lane(
     }
 }
 
+/// Responses -> chat translation lane, the mirror of `translated_responses_lane`:
+///
+/// * an upstream error is forwarded untouched (chat error bodies already use the OpenAI error
+///   shape);
+/// * a JSON `chat.completion` becomes one Responses object (`chat_json_to_responses`);
+/// * an SSE body (a chat upstream that streams regardless of `stream:false`) is translated and
+///   folded into one Responses object — the client asked for JSON, so it must never see chat
+///   chunks (`chat_sse_to_responses_json`).
+#[allow(clippy::too_many_arguments)]
+async fn translated_chat_lane(
+    state: &Arc<AppState>,
+    ctx: &ProxyContext,
+    response: reqwest::Response,
+    status: StatusCode,
+    backend_id: i64,
+    backend_name: &str,
+    pre_forward_ms: u64,
+    ttfb_ms: u64,
+    reservation: Option<BudgetReservation>,
+    concurrency: Option<ConcurrencyGuard>,
+    lease: BackendLease,
+) -> Response<Body> {
+    let upstream_status = status.as_u16();
+    let mut reporter = CompletionReporter::new(
+        state.clone(),
+        ctx,
+        backend_id,
+        backend_name.to_string(),
+        pre_forward_ms,
+        ttfb_ms,
+        reservation,
+        concurrency,
+        lease,
+    );
+    match read_bounded_response(response, TRANSLATED_RESPONSE_BODY_LIMIT).await {
+        Ok((body, upstream_headers)) => {
+            if !status.is_success() {
+                reporter.finish(upstream_status, 0, 0, true, false, None);
+                return build_response(status, upstream_headers, Body::from(body));
+            }
+            let translated = if looks_like_sse(&body) {
+                crate::translate_chat_responses::chat_sse_to_responses_json(&body, &ctx.model_name)
+            } else {
+                crate::translate_chat_responses::chat_json_to_responses(&body, &ctx.model_name)
+            };
+            match translated {
+                Some(response) => {
+                    let bytes = response.to_string();
+                    let acc = parse_usage_from_body(bytes.as_bytes(), BackendFormat::OpenAi);
+                    reporter.finish(
+                        upstream_status,
+                        acc.input_tokens,
+                        acc.output_tokens,
+                        !acc.seen_usage,
+                        false,
+                        None,
+                    );
+                    build_response(
+                        StatusCode::OK,
+                        json_content_type_headers(),
+                        Body::from(bytes),
+                    )
+                }
+                None => {
+                    reporter.finish(
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        0,
+                        0,
+                        true,
+                        false,
+                        Some("responses->chat translation failed".to_string()),
+                    );
+                    build_response(
+                        StatusCode::BAD_GATEWAY,
+                        reqwest::header::HeaderMap::new(),
+                        Body::from(
+                            "responses->chat translation: could not translate the upstream \
+                             chat body into a response object",
+                        ),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            reporter.finish(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                0,
+                0,
+                true,
+                false,
+                Some(e.clone()),
+            );
+            build_response(
+                StatusCode::BAD_GATEWAY,
+                reqwest::header::HeaderMap::new(),
+                Body::from(format!(
+                    "responses->chat translation response read failed: {e}"
+                )),
+            )
+        }
+    }
+}
+
 /// Điểm vào proxy: chọn backend (lease), retry trước byte đầu, forward response (stream thật).
 pub async fn proxy_forward(
     state: Arc<AppState>,
@@ -1429,11 +1560,15 @@ pub async fn proxy_forward(
         };
 
         let endpoint = ctx.route.endpoint_for(backend_id);
-        // Chat -> Responses translation is decided per attempt: the route protocol is what the
+        // Cross-protocol translation is decided per attempt: the route protocol is what the
         // client called, the endpoint protocol is what this upstream speaks. The mismatch itself is
         // the trigger — there is no config switch.
         let endpoint_protocol = ProviderProtocol::parse(&endpoint.protocol);
         let translate_chat = crate::translate_chat_responses::chat_to_responses_applies(
+            ctx.protocol,
+            endpoint_protocol,
+        );
+        let translate_responses = crate::translate_chat_responses::responses_to_chat_applies(
             ctx.protocol,
             endpoint_protocol,
         );
@@ -1478,6 +1613,33 @@ pub async fn proxy_forward(
                                     reqwest::header::HeaderMap::new(),
                                     Body::from(
                                         "could not translate the chat request into the responses protocol",
+                                    ),
+                                ),
+                                &ctx.request_id,
+                                Some(&backend.name),
+                                start.elapsed().as_millis() as u64,
+                            );
+                        }
+                    }
+                } else if translate_responses {
+                    match crate::translate_chat_responses::responses_request_to_chat(
+                        &body,
+                        &endpoint.provider_model_name,
+                    ) {
+                        Some(translated) => {
+                            // Keep the original Responses body for a retry on another endpoint,
+                            // exactly like the chat->responses arm above.
+                            upload_body = Some(ProxyRequestBody::Buffered(original_body));
+                            reqwest::Body::from(Bytes::from(translated))
+                        }
+                        None => {
+                            request_total_for(&ctx, &backend.name, 400);
+                            return tag_router_headers(
+                                build_response(
+                                    StatusCode::BAD_REQUEST,
+                                    reqwest::header::HeaderMap::new(),
+                                    Body::from(
+                                        "could not translate the responses request into the chat protocol",
                                     ),
                                 ),
                                 &ctx.request_id,
@@ -1541,7 +1703,7 @@ pub async fn proxy_forward(
             // A translated request is rebuilt from a buffered body; a streaming upload can never be
             // translated. The handler already forces the buffered path for endpoint groups — this is
             // the proxy-side backstop.
-            ProxyRequestBody::Streaming { .. } if translate_chat => {
+            ProxyRequestBody::Streaming { .. } if translate_chat || translate_responses => {
                 request_total_for(&ctx, &backend.name, 400);
                 return tag_router_headers(
                     build_response(
@@ -1584,6 +1746,11 @@ pub async fn proxy_forward(
             // `/responses` to a Codex-style base URL exactly like a native Responses route.
             let target_uri =
                 Uri::from_static(crate::translate_chat_responses::RESPONSES_UPSTREAM_PATH);
+            build_target_url(&backend.base_url, &target_uri)
+        } else if translate_responses {
+            // Mirror image: the translated body speaks chat, so the upstream path must be
+            // `/v1/chat/completions` regardless of the `/v1/responses` path the client called.
+            let target_uri = Uri::from_static(crate::translate_chat_responses::CHAT_UPSTREAM_PATH);
             build_target_url(&backend.base_url, &target_uri)
         } else {
             build_target_url(&backend.base_url, &uri)
@@ -1737,10 +1904,11 @@ pub async fn proxy_forward(
                             concurrency,
                             l,
                         );
-                        let translator =
-                            Some(crate::translate_chat_responses::ResponsesSseToChat::new(
+                        let translator = Some(SseTranslator::ResponsesToChat(
+                            crate::translate_chat_responses::ResponsesSseToChat::new(
                                 &ctx.model_name,
-                            ));
+                            ),
+                        ));
                         let resp = forward_backend_response(
                             resp,
                             backend.format,
@@ -1758,6 +1926,64 @@ pub async fn proxy_forward(
                         );
                     }
                     let adapted = translated_responses_lane(
+                        &state,
+                        &ctx,
+                        resp,
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        backend_id,
+                        &backend.name,
+                        pre_forward_ms,
+                        ttfb_ms,
+                        reservation,
+                        concurrency,
+                        l,
+                    )
+                    .await;
+                    return tag_router_headers(
+                        adapted,
+                        &ctx.request_id,
+                        Some(&backend.name),
+                        pre_forward_ms,
+                    );
+                }
+                // Responses -> chat translation lane, symmetric to the one above: the pump
+                // translates chat chunks into Responses events for a streaming client; everything
+                // else goes through the buffered translator with errors untouched.
+                if translate_responses {
+                    if stream_request && status < 400 {
+                        let reporter = CompletionReporter::new(
+                            state.clone(),
+                            &ctx,
+                            backend_id,
+                            backend.name.clone(),
+                            pre_forward_ms,
+                            ttfb_ms,
+                            reservation,
+                            concurrency,
+                            l,
+                        );
+                        let translator = Some(SseTranslator::ChatToResponses(
+                            crate::translate_chat_responses::ChatSseToResponses::new(
+                                &ctx.model_name,
+                            ),
+                        ));
+                        let resp = forward_backend_response(
+                            resp,
+                            backend.format,
+                            endpoint.quota_key.as_ref(),
+                            &state.quota,
+                            reporter,
+                            translator,
+                        )
+                        .await;
+                        return tag_router_headers(
+                            resp,
+                            &ctx.request_id,
+                            Some(&backend.name),
+                            pre_forward_ms,
+                        );
+                    }
+                    let adapted = translated_chat_lane(
                         &state,
                         &ctx,
                         resp,
@@ -2441,6 +2667,39 @@ mod tests {
             build_target_url("https://chatgpt.com/backend-api/codex", &uri),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn reverse_translated_request_targets_chat_path() {
+        // The mirror image: a Responses client translated onto a chat endpoint always calls
+        // /v1/chat/completions upstream, no matter which base URL style the backend declares.
+        let uri: Uri = crate::translate_chat_responses::CHAT_UPSTREAM_PATH
+            .parse()
+            .unwrap();
+        assert_eq!(
+            build_target_url("https://api.openai.com/v1", &uri),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_target_url("https://api.deepseek.com", &uri),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_target_url("https://dashscope.example.com/compatible-mode/v1", &uri),
+            "https://dashscope.example.com/compatible-mode/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn tap_reads_usage_nested_in_responses_events() {
+        // The translated Responses lane emits usage under response.usage (the real Responses
+        // wire shape); the tap must read it from there, same as passthrough Responses upstreams.
+        let chunk = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18}}}\n\n";
+        let mut acc = UsageAccumulator::default();
+        extract_usage_from_sse_chunk(chunk, BackendFormat::OpenAi, &mut acc);
+        assert!(acc.seen_usage);
+        assert_eq!(acc.input_tokens, 11);
+        assert_eq!(acc.output_tokens, 7);
     }
 
     #[test]
