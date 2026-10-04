@@ -134,7 +134,10 @@ impl BackendCatalog {
     }
 
     pub fn is_stale(&self, now_ms: u64, max_age_ms: u64) -> bool {
-        now_ms.saturating_sub(self.fetched_at_ms) > max_age_ms
+        // A failed last attempt (including "never fetched successfully") counts as stale
+        // regardless of age, so an on-miss refresh can recover as soon as the backoff window
+        // allows instead of waiting out the full max-age.
+        !self.ok || now_ms.saturating_sub(self.fetched_at_ms) > max_age_ms
     }
 }
 
@@ -360,6 +363,9 @@ mod tests {
             opencode_free: false,
             dynamic_models: dynamic,
             enabled: true,
+            provider_type: None,
+            protocol: String::new(),
+            auth_mode: String::new(),
         }
     }
 

@@ -936,6 +936,9 @@ mod tests {
             opencode_free: false,
             dynamic_models: false,
             enabled,
+            provider_type: None,
+            protocol: String::new(),
+            auth_mode: String::new(),
         }
     }
 

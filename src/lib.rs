@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod oauth;
 pub mod opencode_free;
 pub mod provider_auth;
+pub mod provider_registry;
 pub mod proxy;
 pub mod quota;
 pub mod route;
