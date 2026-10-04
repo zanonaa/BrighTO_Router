@@ -409,9 +409,7 @@ fn models_list_payload(
 ) -> serde_json::Value {
     let mut ids: Vec<String> = routes
         .iter()
-        // Passthrough routes carry no model of their own — their backend's catalog
-        // provides the real ids below.
-        .filter(|(_, route)| route.enabled && !route.passthrough)
+        .filter(|(_, route)| route.enabled)
         .map(|(model, _)| model.clone())
         .collect();
     let mut passthrough_backend_ids: Vec<i64> = routes
@@ -1421,7 +1419,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["free-passthrough", "pinned-model", "rotating-free-model"],
+            vec!["pinned-model", "rotating-free-model"],
             "route ids union catalog ids, deduped, route wins on collision; catalogs without \
              an enabled passthrough route stay hidden"
         );
@@ -1443,16 +1441,11 @@ mod tests {
         catalogs.apply_fetch(9, Ok(vec!["hidden-disabled-backend".to_string()]), 1);
 
         let payload = models_list_payload(&snapshot.routes, &snapshot.backends, &catalogs);
-        let ids: Vec<&str> = payload["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
-        // The disabled route and both catalogs leak nothing. The enabled route's own name is
-        // still advertised (same rule as any enabled route), even though its backend is down
-        // and it can therefore serve no catalog models.
-        assert_eq!(ids, vec!["free-passthrough-2"]);
+        assert!(
+            payload["data"].as_array().unwrap().is_empty(),
+            "disabled passthrough route and disabled backend must not leak catalog ids; a \
+             passthrough row's own name is never advertised"
+        );
     }
 
     #[test]
