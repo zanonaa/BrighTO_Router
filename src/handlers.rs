@@ -617,10 +617,20 @@ async fn handle_generate(
         protocol,
         !route.endpoints.is_empty(),
     );
+    // Chat -> Responses translation rewrites the whole body per selected endpoint, so a translated
+    // request must take the buffered rewrite path like the other JSON adapters — never a streaming
+    // upload. Implied by `endpoints` being non-empty, but explicit so the invariant cannot rot.
+    let may_translate = route.endpoints.values().any(|endpoint| {
+        crate::translate_chat_responses::chat_to_responses_applies(
+            protocol,
+            ProviderProtocol::parse(&endpoint.protocol),
+        )
+    });
     let allow_streaming_upload = route.backend_ids.len() == 1
         && route.fallback_backend_id.is_none()
         && route.endpoints.is_empty()
-        && !opencode_free;
+        && !opencode_free
+        && !may_translate;
     let body_len = incoming.body_len();
     let est_tokens = estimate_tokens_len(body_len, &route);
     let (head, proxy_body) = match incoming
@@ -669,6 +679,7 @@ async fn handle_generate(
             if !route.endpoints.is_empty()
                 || route.provider_model_name != model
                 || opencode_free
+                || may_translate
                 || protocol == ProviderProtocol::VoyageRerank
                 || protocol == ProviderProtocol::QwenRerank
                 || protocol == ProviderProtocol::SystemOne
