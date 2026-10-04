@@ -128,6 +128,28 @@ textarea{resize:vertical;min-height:72px}
 .nav:hover{background:#111827;color:var(--text)}
 .nav.active{background:var(--primary);color:#fff}
 .nav svg{width:17px;height:17px;flex:0 0 auto}
+/* Advanced nav group: the full editors stay one click away but out of the daily path. */
+.nav-group{display:flex;flex-direction:column;gap:3px;margin:2px 0 3px 14px;padding-left:10px;border-left:1px solid var(--border)}
+.nav-group.hidden{display:none}
+.nav.nav-sub{font-size:12.5px;padding:8px 10px}
+.nav-adv-toggle .chev{width:14px;height:14px;margin-left:auto;transition:transform .15s;flex:0 0 auto}
+.nav-adv-toggle[aria-expanded="true"] .chev{transform:rotate(90deg)}
+
+/* ---------- Combos ---------- */
+.combo-member-list{display:grid;gap:10px;margin:4px 0 12px}
+.combo-member-row{display:grid;grid-template-columns:24px minmax(180px,.9fr) minmax(200px,1.25fr) 120px auto;gap:10px;align-items:end;background:#0b1220;border:1px solid var(--border);border-radius:14px;padding:12px}
+.combo-member-row .field{margin-bottom:0}
+.member-order{font-weight:850;color:var(--accent-text);font-size:13px;padding-bottom:13px}
+.member-actions{display:flex;gap:6px;padding-bottom:2px}
+.weight-hint{margin-top:4px}
+.combo-member-grid{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.combo-member-pill{display:inline-flex;align-items:center;gap:6px;max-width:100%;background:#111827;border:1px solid var(--border2);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--text);overflow-wrap:anywhere;word-break:break-word}
+.combo-member-pill em{font-style:normal;color:var(--accent-text);font-weight:800;font-family:var(--mono);flex:0 0 auto}
+@media(max-width:820px){
+  .combo-member-row{grid-template-columns:1fr;gap:8px}
+  .member-order{padding-bottom:0}
+  .member-actions{padding-bottom:0;justify-content:flex-start}
+}
 .sidebar .foot{margin-top:auto;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:7px}
 .mode-pill{font-size:11px;color:var(--muted);background:#111827;border:1px solid var(--border);border-radius:99px;
   padding:4px 11px;text-align:center;text-transform:uppercase;letter-spacing:.05em;font-weight:700}
@@ -398,6 +420,7 @@ table.conn-table td:first-child .cell-main{display:block!important;white-space:n
 .provider-connect-grid .provider-key-field{grid-column:1 / -1;max-width:560px}
 .provider-connect-grid .oauth-account-field{grid-column:1 / -1;max-width:560px;gap:6px}
 .form-grid .field{margin-bottom:0}
+.provider-add-grid .provider-credential-field{grid-column:1 / -1;max-width:560px}
 .route-model-grid{grid-template-columns:minmax(0,1.25fr) minmax(0,.95fr);align-items:start;margin-bottom:13px}
 .model-map{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:stretch;background:#0b1220;border:1px solid var(--border);border-radius:14px;padding:12px;margin:4px 0 16px}
 .model-map .box{min-width:0;background:rgba(15,23,42,.72);border:1px solid var(--border2);border-radius:11px;padding:10px 12px}
@@ -716,13 +739,18 @@ table.key-list-table td:nth-child(2) .compact-line,table.key-list-table td:nth-c
       <div class="row"><div class="logo">B</div><h1>BrighTO</h1></div>
       <div class="sub" id="sidebar-sub">Admin Portal</div>
     </div>
-    <button class="nav active" data-view="dashboard" onclick="go('dashboard')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z"/></svg>Dashboard</button>
     <button class="nav" data-view="providers" onclick="go('providers')" id="nav-providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/></svg>Providers</button>
-    <button class="nav" data-view="models" onclick="go('models')" id="nav-models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9 5-9 5-9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg>Models &amp; Routes</button>
-    <button class="nav" data-view="teams" onclick="go('teams')" id="nav-teams"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>Teams</button>
-    <button class="nav" data-view="keys" onclick="go('keys')" id="nav-keys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zM15 6l3 3m-1-4l3 3"/></svg>API Keys</button>
-    <button class="nav" data-view="usage" onclick="go('usage')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-7"/></svg>Usage</button>
-    <button class="nav" data-view="settings" onclick="go('settings')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Settings</button>
+    <button class="nav" data-view="combos" onclick="go('combos')" id="nav-combos"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9 5-9 5-9-5zM3 12l9 5 9-5M3 17l9 5 9-5"/></svg>Combos</button>
+    <button class="nav" data-view="keys" onclick="go('keys')" id="nav-keys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zM15 6l3 3m-1-4l3 3"/></svg>Keys</button>
+    <button class="nav nav-adv-toggle" id="nav-advanced-toggle" onclick="toggleAdvancedNav(this)" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>Advanced<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></button>
+    <div class="nav-group hidden" id="nav-advanced">
+      <button class="nav nav-sub" data-view="dashboard" onclick="go('dashboard')">Dashboard</button>
+      <button class="nav nav-sub" data-view="models" onclick="go('models')" id="nav-models">Models &amp; Routes</button>
+      <button class="nav nav-sub" data-view="advanced-providers" onclick="go('advanced-providers')" id="nav-advanced-providers">Endpoints (advanced)</button>
+      <button class="nav nav-sub" data-view="teams" onclick="go('teams')" id="nav-teams">Teams</button>
+      <button class="nav nav-sub" data-view="usage" onclick="go('usage')">Usage</button>
+      <button class="nav nav-sub" data-view="settings" onclick="go('settings')">Settings</button>
+    </div>
     <div class="foot">
       <div class="mode-pill" id="mode-pill">Admin</div>
       <button class="btn ghost sm" onclick="logout()">Sign out</button>
@@ -751,7 +779,7 @@ table.key-list-table td:nth-child(2) .compact-line,table.key-list-table td:nth-c
 var mode = "admin";
 var authKey = "";
 var loginBusy = false;
-var backends = [], routes = [], teams = [], keys = [], catalog = [];
+var backends = [], routes = [], teams = [], keys = [], catalog = [], combos = [], providerRegistry = [];
 /* Connected OAuth accounts. Loaded lazily alongside `catalog`: an admin on a build with no OAuth
    provider connected must not pay for a request that can only 404. */
 var oauthProviders = [], oauthAccounts = [];
@@ -872,9 +900,12 @@ function enterApp(){
   $("sidebar-sub").textContent = mode==="admin" ? "Admin Portal" : "User Portal";
   $("verified-label").textContent = mode==="admin" ? "Admin key verified" : "API key verified";
   $("mode-pill").textContent = mode==="admin" ? "Admin" : "User · "+(authKey.slice(0,8)||"");
-  ["providers","models","teams","keys"].forEach(function(v){
+  ["providers","combos","keys","models","teams","advanced-providers"].forEach(function(v){
     var n=$("nav-"+v); if(n) n.style.display = mode==="admin" ? "" : "none";
   });
+  var advToggle=$("nav-advanced-toggle"), advGroup=$("nav-advanced");
+  if(advToggle) advToggle.style.display = mode==="admin" ? "" : "none";
+  if(advGroup && mode!=="admin") advGroup.classList.add("hidden");
   var settingsNav=$("nav-settings"); if(settingsNav) settingsNav.style.display="";
   if(mode==="user"){
     document.querySelectorAll(".nav").forEach(function(n){ n.classList.remove("active"); });
@@ -911,14 +942,27 @@ async function restoreSession(){
 function logout(){ authKey=""; setLoginBusy(false); clearLoginError(); clearSession(); $("app-view").classList.add("hidden"); $("login-view").classList.remove("hidden"); $("content").innerHTML=""; }
 
 /* ===== Nav ===== */
-var titles={dashboard:"Dashboard",providers:"Providers",models:"Models & Routes",teams:"Teams",keys:"API Keys",usage:"Usage",settings:"Settings"};
-var descs={dashboard:"Gateway overview",providers:"Connect AI provider endpoints",models:"Approve routes to models",teams:"Teams and budgets",keys:"Client access, expiry, budgets, and model scope",usage:"Tokens, cost, errors, and speed",settings:"Runtime configuration"};
+var titles={combos:"Combos",providers:"Providers",keys:"Keys",dashboard:"Dashboard","advanced-providers":"Endpoints (advanced)",models:"Models & Routes",teams:"Teams",usage:"Usage",settings:"Settings"};
+var descs={combos:"One public model name over an ordered member list",providers:"Connect provider backends from the built-in registry",keys:"Client access, expiry, budgets, and model scope",dashboard:"Gateway overview","advanced-providers":"Full endpoint editor — weight, concurrency, format",models:"Manual routes, Model Groups, and passthrough",teams:"Teams and budgets",usage:"Tokens, cost, errors, and speed",settings:"Runtime configuration"};
 var userDescs={dashboard:"Your API access and usage",usage:"Your tokens, speed, and request history",settings:"Portal preferences and session"};
+var advancedViews=["dashboard","models","advanced-providers","teams","usage","settings"];
 function pageDesc(view){ return mode==="user" && userDescs[view] ? userDescs[view] : descs[view]; }
+function toggleAdvancedNav(btn){
+  var g=$("nav-advanced"); if(!g) return;
+  var open=!g.classList.contains("hidden");
+  g.classList.toggle("hidden",open);
+  if(btn) btn.setAttribute("aria-expanded",open?"false":"true");
+}
+function openAdvancedNav(){
+  var g=$("nav-advanced"); if(g) g.classList.remove("hidden");
+  var t=$("nav-advanced-toggle"); if(t) t.setAttribute("aria-expanded","true");
+}
 function go(view){
   var active=document.querySelector(".nav.active");
   if(active && active.dataset.view!==view) clearToasts();
   document.querySelectorAll(".nav").forEach(function(n){ n.classList.toggle("active", n.dataset.view===view); });
+  /* Landing on an advanced screen opens the group so the active item is visible. */
+  if(advancedViews.indexOf(view)>=0) openAdvancedNav();
   $("page-title").textContent=titles[view]; $("page-desc").textContent=pageDesc(view);
   closeSidebar(); // close mobile sidebar after navigation
   render(view);
@@ -930,12 +974,14 @@ async function refresh(){
       routes=await api("/admin/routes","GET");
       teams=await api("/admin/teams","GET");
       keys=await api("/admin/keys","GET");
+      try{ providerRegistry=await api("/admin/providers","GET"); }catch(e){ providerRegistry=[]; }
+      try{ combos=await api("/admin/combos","GET"); }catch(e){ combos=[]; }
       try{ catalog=await api("/admin/provider-catalog","GET"); }catch(e){ catalog=[]; }
       await refreshOAuth();
       await refreshQuota(false);
     }
     var cur=document.querySelector(".nav.active");
-    if(cur) render(cur.dataset.view); else go("dashboard");
+    if(cur && cur.dataset.view) render(cur.dataset.view); else go(mode==="admin"?"combos":"dashboard");
   }catch(e){ toast("Data refresh failed: "+e.message,"err"); }
 }
 function rerender(){ var cur=document.querySelector(".nav.active"); if(cur) render(cur.dataset.view); else go("dashboard"); }
@@ -947,10 +993,12 @@ function render(view){
   var seq=++renderSerial;
   c.dataset.renderSeq=String(seq);
   c.innerHTML="";
-  if(mode==="user" && ["providers","models","teams","keys"].indexOf(view)>=0) view="dashboard";
+  if(mode==="user" && ["providers","combos","models","teams","keys","advanced-providers"].indexOf(view)>=0) view="dashboard";
   try{
     if(view==="dashboard") return renderDashboard(c,seq).then(function(){ finishRender(c,seq); }).catch(function(e){ if(isCurrentRender(c,seq)) toast("Dashboard failed: "+e.message,"err"); });
-    else if(view==="providers") renderProviders(c);
+    else if(view==="providers") renderProviderBackends(c);
+    else if(view==="combos") renderCombos(c);
+    else if(view==="advanced-providers") renderProviders(c);
     else if(view==="models") renderModels(c);
     else if(view==="teams") renderTeams(c);
     else if(view==="keys") renderKeys(c);
@@ -1266,7 +1314,537 @@ async function renderDashboard(c,seq){
   if(diagNodes.length) c.appendChild(diagnosticDetails(diagNodes));
 }
 
-/* ===== Providers ===== */
+/* ===== Providers (minimal, registry-driven) ===== */
+/* The operator-facing screen: pick a provider type from GET /admin/providers, paste one
+   credential (or connect an OAuth account), and the backend derives base_url/format/wiring.
+   The old full endpoint editor stays one click away under Advanced. */
+var providerFormDraft={}; // survives the rerender the OAuth connect modal triggers
+function registryEntry(slug){ return (providerRegistry||[]).find(function(p){return p.slug===slug;})||null; }
+/* Registry entries for OAuth providers carry their oauth auth_mode; the OAuth spec table is
+   keyed by catalog key. Matching on auth_mode is the join the backend itself uses. */
+function registryOauthSpec(entry){ return entry ? ((oauthProviders||[]).find(function(p){return p.auth_mode===entry.auth_mode;})||null) : null; }
+function backendIsOauth(b){ return String(b.api_key_ref||"").indexOf("oauth:")===0; }
+function backendCredentialLabel(b){
+  if(backendIsOauth(b)) return pill("OAuth account","info");
+  return pill(b.key_resolved?"key resolved":"no key", b.key_resolved?"on":"off");
+}
+function fmtTsMs(ms){ if(!ms) return "never"; return new Date(ms).toISOString().replace("T"," ").slice(0,16)+" UTC"; }
+
+function renderProviderBackends(c){
+  c.innerHTML="";
+  var enabled=backends.filter(function(b){return b.enabled;}).length;
+  var credentialed=backends.filter(function(b){return b.key_resolved||backendIsOauth(b);}).length;
+  c.appendChild(summaryStrip([
+    ["Providers",fmt(backends.length),"configured backends","info"],
+    ["Enabled",fmt(enabled),"ready for combos and routes",enabled?"ok":"warn"],
+    ["Credentials",fmt(credentialed),"key resolved or OAuth attached",credentialed===backends.length&&backends.length?"ok":"warn"],
+    ["Dynamic catalogs",fmt(backends.filter(function(b){return b.dynamic_models;}).length),"model ids from the provider","info"]
+  ]));
+  c.appendChild(addProviderPanel());
+  c.appendChild(providerBackendListPanel());
+  // Connected accounts + allowance stay on this screen: an OAuth backend is two steps
+  // (connect account, then reference it), and the account lives here.
+  c.appendChild(renderOAuthPanel());
+  c.appendChild(renderQuotaPanel());
+}
+
+function addProviderPanel(){
+  var p=el("div","panel");
+  var h=el("div","panel-head"); h.appendChild(el("h3",null,"Add provider"));
+  p.appendChild(h);
+  p.appendChild(el("p","hint","Pick a provider type and paste one credential — the endpoint URL, dialect, and wiring are derived from the built-in registry. OAuth types connect an account instead of a key."));
+  if(!(providerRegistry||[]).length){
+    p.appendChild(emptyBox("Provider registry unavailable (older router build). Use Advanced → Endpoints instead."));
+    return p;
+  }
+  var grid=el("div","form-grid provider-add-grid");
+
+  var ft=el("div","field"); ft.appendChild(el("label",null,"Provider type"));
+  var ts=el("select");
+  providerRegistry.forEach(function(e){
+    var kind=registryOauthSpec(e)?"OAuth":(e.requires_credential?"API key":"custom URL");
+    var o=el("option",null,e.display_name+" · "+kind); o.value=e.slug; ts.appendChild(o);
+  });
+  if(providerFormDraft.type) ts.value=providerFormDraft.type;
+  ft.appendChild(ts); grid.appendChild(ft);
+
+  var fn=el("div","field"); fn.appendChild(el("label",null,"Backend name"));
+  var nameIn=el("input"); nameIn.placeholder="my-provider";
+  fn.appendChild(nameIn); grid.appendChild(fn);
+
+  var fc=el("div","field provider-credential-field");
+  grid.appendChild(fc);
+  p.appendChild(grid);
+
+  var note=el("p","hint"); p.appendChild(note);
+  var urlIn=null, keyIn=null, accountSel=null, connectBtn=null;
+  var lastDefaultName="";
+
+  function drawCredential(){
+    var e=registryEntry(ts.value)||{};
+    var oa=registryOauthSpec(e);
+    fc.innerHTML="";
+    if(nameIn.value===lastDefaultName || !nameIn.value){ nameIn.value=e.slug||""; lastDefaultName=nameIn.value; }
+    if(oa){
+      fc.appendChild(el("label",null,"Connected account"));
+      var wrap=el("div","input-action-row");
+      accountSel=el("select");
+      var connectRow=el("div","row");
+      connectBtn=el("button","btn ghost","Connect account…"); connectBtn.type="button";
+      connectRow.appendChild(connectBtn);
+      fillAccountOptions();
+      wrap.appendChild(accountSel);
+      fc.appendChild(wrap);
+      fc.appendChild(connectRow);
+      keyIn=null; urlIn=null;
+      note.textContent=e.notes||"";
+      connectBtn.onclick=function(){
+        openOAuthModal(oa.key);
+        // The connect modal rerenders the screen when it finishes; this poll only needs to
+        // refresh the picker when the modal was closed without a rerender path running.
+        var wait=setInterval(function(){
+          if($("modal-overlay").classList.contains("hidden")){
+            clearInterval(wait);
+            refreshOAuth().then(function(){ if(accountSel) fillAccountOptions(); });
+          }
+        },400);
+      };
+      accountSel.onchange=function(){ providerFormDraft.accountLabel=accountSel.value||""; };
+      if(providerFormDraft.accountLabel) accountSel.value=providerFormDraft.accountLabel;
+    } else if(e.base_url==null){
+      // custom-openai: the one registry entry where the caller owns the URL.
+      var fu=el("div","field"); fu.appendChild(el("label",null,"Base URL (required)"));
+      urlIn=el("input"); urlIn.placeholder="http://127.0.0.1:8088/v1";
+      urlIn.value=providerFormDraft.baseUrl||""; fu.appendChild(urlIn);
+      urlIn.oninput=function(){ providerFormDraft.baseUrl=urlIn.value; };
+      var fk=el("div","field"); fk.appendChild(el("label",null,"API key (optional — blank for no-auth endpoints)"));
+      keyIn=el("input"); keyIn.type="password"; keyIn.placeholder="sk-…"; keyIn.autocomplete="off";
+      fk.appendChild(keyIn);
+      var g2=el("div","form-grid"); g2.appendChild(fu); g2.appendChild(fk);
+      fc.appendChild(g2);
+      accountSel=null;
+      note.textContent=e.notes||"";
+    } else {
+      fc.appendChild(el("label",null,"API key"));
+      keyIn=el("input"); keyIn.type="password"; keyIn.placeholder="sk-…"; keyIn.autocomplete="off";
+      fc.appendChild(keyIn);
+      accountSel=null; urlIn=null;
+      note.textContent=(e.notes||"")+(e.base_url?(" Endpoint: "+e.base_url):"");
+    }
+    function fillAccountOptions(){
+      accountSel.innerHTML="";
+      var mine=oauthAccountsFor(oa.key);
+      if(!mine.length){
+        var none=el("option",null,"No account connected yet"); none.value=""; accountSel.appendChild(none);
+      }else{
+        mine.forEach(function(a){
+          var o=el("option",null,(a.account_name||a.label)+" — "+oauthTokenStateLabel(a.last_refresh_state));
+          o.value=a.label; accountSel.appendChild(o);
+        });
+      }
+      if(providerFormDraft.accountLabel && mine.some(function(a){return a.label===providerFormDraft.accountLabel;})) accountSel.value=providerFormDraft.accountLabel;
+    }
+  }
+
+  ts.onchange=function(){ providerFormDraft.type=ts.value; providerFormDraft.accountLabel=""; drawCredential(); };
+  nameIn.oninput=function(){ providerFormDraft.name=nameIn.value; };
+  drawCredential();
+  if(providerFormDraft.name) nameIn.value=providerFormDraft.name;
+
+  var act=el("div","row");
+  var addBtn=el("button","btn primary","Add provider");
+  addBtn.onclick=async function(){
+    var e=registryEntry(ts.value);
+    if(!e){ toast("Choose a provider type first","err"); return; }
+    var name=(nameIn.value.trim()||e.slug);
+    var payload={name:name, provider_type:e.slug, enabled:true};
+    var oa=registryOauthSpec(e);
+    if(oa){
+      var label=accountSel?accountSel.value:"";
+      if(!label){ toast("Connect an account for "+e.display_name+" first, then pick it","err"); return; }
+      payload.api_key_ref=oauthCredentialRef(oa.key,label);
+    } else if(e.base_url==null){
+      var u=urlIn?String(urlIn.value||"").trim():"";
+      if(!u){ toast("Base URL is required for "+e.display_name,"err"); return; }
+      payload.base_url=u;
+      if(keyIn&&keyIn.value.trim()) payload.key=keyIn.value.trim();
+    } else {
+      if(!keyIn||!String(keyIn.value||"").trim()){ toast("Paste the "+e.display_name+" API key","err"); return; }
+      payload.key=String(keyIn.value).trim();
+    }
+    addBtn.disabled=true;
+    try{
+      await api("/admin/backends","POST",payload);
+      toast("Provider "+name+" added");
+      if(keyIn) keyIn.value="";
+      providerFormDraft={};
+      backends=await api("/admin/backends","GET"); rerender();
+    }catch(err){ toast("Add failed: "+err.message,"err"); }
+    finally{ addBtn.disabled=false; }
+  };
+  act.appendChild(addBtn); p.appendChild(act);
+  return p;
+}
+
+function providerBackendListPanel(){
+  var p=el("div","panel");
+  var h=el("div","panel-head"); h.appendChild(el("h3",null,"Providers"));
+  var ha=el("div","panel-head-actions");
+  var adv=el("button","btn ghost sm","Advanced endpoint editor");
+  adv.title="Full editor: weight, concurrency caps, format — for live instances with manual routes.";
+  adv.onclick=function(){ go("advanced-providers"); };
+  ha.appendChild(adv); h.appendChild(ha); p.appendChild(h);
+  p.appendChild(el("p","hint","One row per provider backend. Combos and routes send traffic to enabled providers only."));
+  if(!backends.length){ p.appendChild(emptyBox("No providers yet — add one above.")); return p; }
+  var w=el("div","table-wrap pro-table provider-list-wrap"); var t=el("table","conn-table provider-list-table");
+  var colg=document.createElement("colgroup");
+  ["22%","26%","16%","12%","8%","16%"].forEach(function(wid){ var c=document.createElement("col"); c.style.width=wid; colg.appendChild(c); });
+  t.appendChild(colg);
+  t.appendChild(thead(["Provider","Base URL","Status","Dynamic models","Usage",""]));
+  var tb=el("tbody");
+  backends.forEach(function(b){
+    var tr=el("tr"); tr.setAttribute("data-id",b.id);
+    var nc=el("td"); var ns=el("div","stack-cell");
+    ns.appendChild(nameNode("div","cell-main compact-line",b.name));
+    ns.appendChild(el("div","cell-sub",(b.provider_type||"custom")+" · "+(b.format==="anthropic"?"Anthropic Messages":"OpenAI-compatible")));
+    nc.appendChild(ns); tr.appendChild(nc);
+    var bu=el("td","mono");
+    var bus=el("span","truncate compact-line",String(b.base_url||"—").replace("https://","").replace("http://",""));
+    bus.title=b.base_url||""; bu.appendChild(bus); tr.appendChild(bu);
+    var st=el("td"); var ss=el("div","stack-cell");
+    ss.appendChild(pill(b.enabled?"Enabled":"Disabled",b.enabled?"on":"off"));
+    ss.appendChild(backendCredentialLabel(b));
+    st.appendChild(ss); tr.appendChild(st);
+    var dm=el("td");
+    var dbtn=el("button","btn sm ghost",b.dynamic_models?"On":"Off");
+    dbtn.title="Dynamic catalog: expose every model id this provider lists at /v1/models";
+    dbtn.onclick=function(){ toggleBackendDynamic(b); };
+    dm.appendChild(dbtn); tr.appendChild(dm);
+    var us=el("td","num",fmt(b.usage_count||0));
+    us.title=(b.active_route_count||0)+" active route(s) · "+fmt(b.usage_count||0)+" logged request(s)";
+    tr.appendChild(us);
+    var td=el("td","actions"); var row=el("div","action-row");
+    var tg=el("button","btn sm ghost",b.enabled?"Disable":"Enable"); tg.onclick=function(){ toggleBackend(b); };
+    row.appendChild(tg);
+    if(!backendIsOauth(b)){
+      var kb=el("button","btn sm ghost","Key"); kb.title="Replace the stored provider key (write-only)"; kb.onclick=function(){ openBackendKeyModal(b); };
+      row.appendChild(kb);
+    }
+    var mb=el("button","btn sm ghost","Models"); mb.title="Dynamic catalog ids, or a live fetch"; mb.onclick=function(){ viewBackendModels(b); };
+    row.appendChild(mb);
+    var d=el("button","btn sm danger","Delete");
+    if(!b.can_delete){ d.disabled=true; d.title=(b.delete_blockers||[]).join("; ")||"Cannot delete"; }
+    else { d.onclick=function(){ deleteProvider(b); }; }
+    row.appendChild(d); td.appendChild(row); tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb); w.appendChild(t); p.appendChild(w);
+  return p;
+}
+
+async function toggleBackendDynamic(b){
+  try{
+    await api("/admin/backends/"+b.id,"PATCH",{dynamic_models:!b.dynamic_models});
+    toast("Dynamic models "+(b.dynamic_models?"off":"on")+" for "+b.name);
+    backends=await api("/admin/backends","GET"); rerender();
+  }catch(e){ toast("Toggle failed: "+e.message,"err"); }
+}
+
+/* Write-only key update: the secret is never rendered again after this. */
+function openBackendKeyModal(b){
+  var ov=$("modal-overlay"); ov.innerHTML="";
+  var m=el("div","modal");
+  m.appendChild(modalHeader("Update key · "+b.name));
+  m.appendChild(el("p","hint","Paste a new provider API key. It is written to the secrets directory (mode 0600) and never displayed again."));
+  var f=el("div","field"); f.appendChild(el("label",null,"Provider API key"));
+  var ki=el("input"); ki.type="password"; ki.placeholder="sk-…"; ki.autocomplete="off";
+  f.appendChild(ki); m.appendChild(f);
+  var act=el("div","actions");
+  var cancel=el("button","btn","Cancel"); cancel.onclick=closeModal;
+  var save=el("button","btn primary","Save key");
+  save.onclick=async function(){
+    var v=cleanCredential(ki.value);
+    if(!v){ toast("Paste the new key first","err"); ki.focus(); return; }
+    save.disabled=true;
+    try{
+      await api("/admin/backends/"+b.id+"/key","PUT",{key:v});
+      closeModal(); toast("Key updated for "+b.name);
+      backends=await api("/admin/backends","GET"); rerender();
+    }catch(e){ toast("Key update failed: "+e.message,"err"); save.disabled=false; }
+  };
+  act.appendChild(cancel); act.appendChild(save); m.appendChild(act);
+  ov.appendChild(m); ov.classList.remove("hidden"); ki.focus();
+}
+
+/* Dynamic catalog (last-known) plus an optional live fetch from the provider. */
+async function viewBackendModels(b){
+  var ov=$("modal-overlay"); ov.innerHTML="";
+  var m=el("div","modal wide-modal");
+  m.appendChild(modalHeader("Models · "+b.name));
+  var status=el("p","hint","Loading catalog…"); m.appendChild(status);
+  var box=el("div","chips"); m.appendChild(box);
+  var act=el("div","actions");
+  var live=el("button","btn","Fetch live");
+  live.title="Call GET {base_url}/v1/models on this provider now";
+  live.onclick=async function(){
+    live.disabled=true; live.textContent="Fetching…";
+    try{
+      var d=await api("/admin/backends/"+b.id+"/models","GET");
+      status.textContent="Live fetch: "+d.models.length+" model(s) from "+b.base_url;
+      drawModels(d.models);
+    }catch(e){ toast("Fetch failed: "+e.message,"err"); }
+    finally{ live.disabled=false; live.textContent="Fetch live"; }
+  };
+  var cl=el("button","btn","Close"); cl.onclick=closeModal;
+  act.appendChild(live); act.appendChild(cl); m.appendChild(act);
+  function drawModels(ids){
+    box.innerHTML="";
+    if(!ids||!ids.length){ box.appendChild(emptyBox("No model ids reported.")); return; }
+    ids.slice(0,300).forEach(function(id){ var ch=el("span","chip",id); ch.title=id; box.appendChild(ch); });
+    if(ids.length>300) box.appendChild(el("div","cell-sub","+"+(ids.length-300)+" more"));
+  }
+  ov.appendChild(m); ov.classList.remove("hidden");
+  try{
+    var d=await api("/admin/backends/"+b.id+"/models-catalog","GET");
+    status.textContent="Dynamic catalog "+(d.dynamic_models?"on":"off")+" · last successful fetch "+fmtTsMs(d.fetched_at_ms)+" · last fetch "+(d.ok?"ok":"failed")+" · "+d.ids.length+" id(s)"+(d.dynamic_models?"":" — turn it on in the table to serve these ids");
+    drawModels(d.ids);
+  }catch(e){ status.textContent="Catalog unavailable: "+e.message; }
+}
+
+/* ===== Combos ===== */
+/* The primary screen: a public model name plus an ORDERED member list. Order is semantic —
+   weights derive 8, 4, 2, then 1 — and every wiring detail (protocol, auth, translation)
+   is derived server-side from each member backend's provider type. */
+var comboDraft=null;
+var comboModelCatalogs={}; // backend_id -> models-catalog response (autocomplete cache)
+function blankComboDraft(){ comboDraft={editing:null,name:"",members:[]}; }
+function comboWeightAt(i){ return [8,4,2][i]||1; }
+
+async function loadBackendCatalog(id,force){
+  if(!force && comboModelCatalogs[id]) return comboModelCatalogs[id];
+  var out={ids:[],dynamic:false,fetched_at_ms:0,ok:false};
+  try{ out=await api("/admin/backends/"+id+"/models-catalog","GET"); }catch(e){}
+  comboModelCatalogs[id]=out;
+  return out;
+}
+function populateMemberDatalist(dl,backendId){
+  dl.innerHTML="";
+  if(!backendId) return;
+  loadBackendCatalog(backendId).then(function(cat){
+    (cat.ids||[]).slice(0,500).forEach(function(id){ var o=el("option",null,id); o.value=id; dl.appendChild(o); });
+  });
+}
+
+function renderCombos(c){
+  c.innerHTML="";
+  if(!comboDraft) blankComboDraft();
+  var enabled=combos.filter(function(x){return x.enabled;}).length;
+  var members=combos.reduce(function(a,x){return a+((x.members||[]).length);},0);
+  c.appendChild(summaryStrip([
+    ["Combos",fmt(combos.length),"public model names","info"],
+    ["Enabled",fmt(enabled),"callable by clients",(enabled||!combos.length)?"ok":"warn"],
+    ["Members",fmt(members),"ordered across combos","info"],
+    ["Enabled providers",fmt(backends.filter(function(b){return b.enabled;}).length),"available as members","ok"]
+  ]));
+  c.appendChild(comboEditorPanel());
+  c.appendChild(comboListPanel());
+}
+
+function comboEditorPanel(){
+  var p=el("div","panel combo-editor-panel");
+  var h=el("div","panel-head");
+  h.appendChild(el("h3",null,comboDraft.editing?("Edit combo · "+comboDraft.editing.name):"New combo"));
+  var ha=el("div","panel-head-actions");
+  if(comboDraft.editing){
+    var cancelBtn=el("button","btn ghost sm","Cancel edit");
+    cancelBtn.onclick=function(){ blankComboDraft(); renderCombos($("content")); };
+    ha.appendChild(cancelBtn);
+  }
+  h.appendChild(ha); p.appendChild(h);
+  p.appendChild(el("p","hint","One public model name backed by an ordered member list. Order sets the weights (8, 4, 2, then 1); leave a weight blank to use the derived one. Mixing chat and responses providers is expected — the router translates."));
+  if(!backends.length){
+    var box=el("div");
+    box.appendChild(emptyBox("No providers yet. Add one on the Providers screen first."));
+    var btn=el("button","btn primary sm","Open Providers"); btn.onclick=function(){ go("providers"); };
+    box.appendChild(btn);
+    p.appendChild(box);
+    return p;
+  }
+  var fn=el("div","field"); fn.appendChild(el("label",null,'Combo name — clients send this as "model"'));
+  var nameIn=el("input"); nameIn.placeholder="coding-fast"; nameIn.value=comboDraft.name;
+  nameIn.style.fontFamily="var(--mono)";
+  fn.appendChild(nameIn); p.appendChild(fn);
+  var list=el("div","combo-member-list"); p.appendChild(list);
+  var addRow=el("div","row");
+  var addBtn=el("button","btn sm","+ Add member"); addBtn.type="button";
+  addBtn.onclick=function(){ comboDraft.members.push({backend_id:"",model:"",weight:""}); drawMembers(); };
+  addRow.appendChild(addBtn); p.appendChild(addRow);
+
+  function drawMembers(){
+    list.innerHTML="";
+    comboDraft.members.forEach(function(mem,idx){
+      var rowEl=el("div","combo-member-row");
+      rowEl.appendChild(el("div","member-order",String(idx+1)));
+      var fb=el("div","field member-backend"); fb.appendChild(el("label",null,"Member backend"));
+      var sel=el("select");
+      var ph=el("option",null,"Choose provider…"); ph.value=""; sel.appendChild(ph);
+      backends.forEach(function(b){
+        var o=el("option",null,b.name+" · "+(b.provider_type||"custom")+(b.enabled?"":" · disabled"));
+        o.value=String(b.id); o.title=b.base_url||""; sel.appendChild(o);
+      });
+      sel.value=mem.backend_id?String(mem.backend_id):"";
+      fb.appendChild(sel);
+      var fm=el("div","field member-model"); fm.appendChild(el("label",null,"Model"));
+      var dlId="combo-dl-"+idx+"-"+Math.random().toString(36).slice(2,7);
+      var modelIn=el("input"); modelIn.setAttribute("list",dlId);
+      modelIn.placeholder="glm-5.3"; modelIn.value=mem.model||"";
+      modelIn.style.fontFamily="var(--mono)";
+      var dl=el("datalist"); dl.id=dlId;
+      sel.onchange=function(){
+        mem.backend_id=sel.value?Number(sel.value):"";
+        populateMemberDatalist(dl,mem.backend_id);
+      };
+      modelIn.oninput=function(){ mem.model=modelIn.value; };
+      fm.appendChild(modelIn); fm.appendChild(dl);
+      rowEl.appendChild(fb); rowEl.appendChild(fm);
+      var fw=el("div","field member-weight"); fw.appendChild(el("label",null,"Weight"));
+      var wIn=el("input"); wIn.type="number"; wIn.min="1"; wIn.step="1";
+      wIn.placeholder=String(comboWeightAt(idx)); wIn.value=mem.weight||"";
+      wIn.title="Blank = derived from member order";
+      var hint=el("div","cell-sub weight-hint");
+      function drawHint(){
+        var explicit=String(wIn.value||"").trim();
+        hint.textContent=explicit?("explicit "+explicit):("derived "+comboWeightAt(idx)+" by order");
+      }
+      wIn.oninput=function(){ mem.weight=wIn.value; drawHint(); };
+      drawHint();
+      fw.appendChild(wIn); fw.appendChild(hint);
+      rowEl.appendChild(fw);
+      var fa=el("div","member-actions");
+      var up=el("button","btn sm ghost","↑"); up.type="button"; up.title="Move up (earlier = heavier)"; up.setAttribute("aria-label","Move member up");
+      up.disabled=idx===0;
+      up.onclick=function(){ comboDraft.members.splice(idx-1,0,comboDraft.members.splice(idx,1)[0]); drawMembers(); };
+      var down=el("button","btn sm ghost","↓"); down.type="button"; down.title="Move down (later = lighter)"; down.setAttribute("aria-label","Move member down");
+      down.disabled=idx===comboDraft.members.length-1;
+      down.onclick=function(){ comboDraft.members.splice(idx+1,0,comboDraft.members.splice(idx,1)[0]); drawMembers(); };
+      var rm=el("button","btn sm danger","✕"); rm.type="button"; rm.title="Remove member"; rm.setAttribute("aria-label","Remove member");
+      rm.onclick=function(){ comboDraft.members.splice(idx,1); drawMembers(); };
+      fa.appendChild(up); fa.appendChild(down); fa.appendChild(rm);
+      rowEl.appendChild(fa);
+      list.appendChild(rowEl);
+      if(mem.backend_id) populateMemberDatalist(dl,mem.backend_id);
+    });
+    if(!comboDraft.members.length) list.appendChild(el("div","empty","No members yet. Add at least one provider member."));
+  }
+  drawMembers();
+
+  var act=el("div","row");
+  var save=el("button","btn primary",comboDraft.editing?"Save combo":"Create combo");
+  save.onclick=async function(){
+    var name=nameIn.value.trim();
+    if(!name){ toast("Combo name is required","err"); nameIn.focus(); return; }
+    if(!comboDraft.members.length){ toast("Add at least one member","err"); return; }
+    for(var i=0;i<comboDraft.members.length;i++){
+      var m=comboDraft.members[i];
+      if(!m.backend_id){ toast("Member "+(i+1)+": choose a provider backend","err"); return; }
+      if(!String(m.model||"").trim()){ toast("Member "+(i+1)+": enter a model name","err"); return; }
+    }
+    var payload={name:name,members:comboDraft.members.map(function(m){
+      var out={backend_id:Number(m.backend_id),model:String(m.model).trim()};
+      var w=Number(m.weight);
+      if(String(m.weight||"").trim()!==""&&Number.isFinite(w)&&w>0) out.weight=Math.floor(w);
+      return out;
+    })};
+    save.disabled=true;
+    try{
+      await api("/admin/combos","POST",payload);
+      toast(comboDraft.editing?("Combo "+name+" updated"):("Combo "+name+" created"));
+      blankComboDraft();
+      combos=await api("/admin/combos","GET");
+      backends=await api("/admin/backends","GET");
+      rerender();
+    }catch(e){ toast("Combo save failed: "+e.message,"err"); save.disabled=false; }
+  };
+  act.appendChild(save); p.appendChild(act);
+  return p;
+}
+
+function comboListPanel(){
+  var p=el("div","panel");
+  var h=el("div","panel-head"); h.appendChild(el("h3",null,"Combos"));
+  h.appendChild(el("span","pill info compact",fmt(combos.length)+" total"));
+  p.appendChild(h);
+  if(!combos.length){
+    p.appendChild(emptyBox("No combos yet. Name one above, add ordered members, save — clients call it like any other model."));
+    return p;
+  }
+  var w=el("div","table-wrap"); var t=el("table","conn-table");
+  t.appendChild(thead(["Combo","Members (order = weights)",""]));
+  var tb=el("tbody");
+  combos.forEach(function(x){
+    var tr=el("tr");
+    var nc=el("td"); var ns=el("div","stack-cell");
+    var nrow=el("div","model-name-row");
+    nrow.appendChild(nameNode("span","cell-main mono",x.name,1000));
+    nrow.appendChild(copyIconBtn(x.name));
+    ns.appendChild(nrow);
+    ns.appendChild(pill(x.enabled?"Enabled":"Disabled",x.enabled?"on":"off"));
+    nc.appendChild(ns); tr.appendChild(nc);
+    var mc=el("td");
+    var mg=el("div","combo-member-grid");
+    (x.members||[]).forEach(function(m,i){
+      var it=el("span","combo-member-pill");
+      it.title=(m.backend_name||("#"+m.backend_id))+" · "+m.model+" · "+m.protocol;
+      it.appendChild(document.createTextNode((i+1)+". "+(m.backend_name||("#"+m.backend_id))+" · "));
+      it.appendChild(el("code",null,m.model));
+      it.appendChild(el("em",null,"w"+m.weight));
+      mg.appendChild(it);
+    });
+    if(!(x.members||[]).length) mg.appendChild(el("span","cell-sub","no members"));
+    mc.appendChild(mg); tr.appendChild(mc);
+    var td=el("td","actions"); var row=el("div","action-row");
+    var tg=el("button","btn sm ghost",x.enabled?"Disable":"Enable"); tg.onclick=function(){ toggleCombo(x); };
+    var ed=el("button","btn sm primary","Edit"); ed.onclick=function(){ editCombo(x); };
+    var del=el("button","btn sm danger","Delete"); del.onclick=function(){ deleteCombo(x); };
+    row.appendChild(tg); row.appendChild(ed); row.appendChild(del); td.appendChild(row); tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb); w.appendChild(t); p.appendChild(w);
+  return p;
+}
+
+/* Pre-fill the form from a listed combo. A weight equal to the derived one becomes blank so
+   an unedited round-trip keeps "by order" semantics. */
+function editCombo(x){
+  comboDraft={editing:x,name:x.name,members:(x.members||[]).map(function(m,i){
+    return {backend_id:m.backend_id,model:m.model,weight:(m.weight===comboWeightAt(i)?"":String(m.weight))};
+  })};
+  renderCombos($("content"));
+  var panel=document.querySelector(".combo-editor-panel");
+  if(panel&&panel.scrollIntoView){ try{ panel.scrollIntoView({behavior:"smooth",block:"start"}); }catch(e){} }
+}
+
+async function toggleCombo(x){
+  try{
+    await api("/admin/combos/"+encodeURIComponent(x.name)+"/enabled","PATCH",{enabled:!x.enabled});
+    toast(x.enabled?"Combo disabled":"Combo enabled");
+    combos=await api("/admin/combos","GET");
+    backends=await api("/admin/backends","GET");
+    rerender();
+  }catch(e){ toast("Toggle failed: "+e.message,"err"); }
+}
+
+async function deleteCombo(x){
+  if(!confirm("Delete combo "+x.name+"? Client calls to this model name will stop working.")) return;
+  try{
+    await api("/admin/combos/"+encodeURIComponent(x.name),"DELETE");
+    toast("Combo "+x.name+" deleted");
+    combos=await api("/admin/combos","GET"); rerender();
+  }catch(e){ toast("Delete failed: "+e.message,"err"); }
+}
+
+/* ===== Advanced: full endpoint editor (the previous Providers screen) =====
+   Kept verbatim for live instances with manually configured endpoints. */
 function renderProviders(c){
   c.innerHTML="";
   c.appendChild(summaryStrip([
