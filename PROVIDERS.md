@@ -246,6 +246,46 @@ The client request does not change:
 
 `coding-fast` can be a single model route today and a Model Group tomorrow without client code changes.
 
+## Combos
+
+A combo is the one-call version of a Model Group: a public model name plus an ordered list of members, one per backend. Everything else is derived — you never pick protocols, auth modes, or routing policies.
+
+```bash
+curl -X POST http://127.0.0.1:8089/admin/combos \
+  -H "x-admin-key: $ADMIN_MASTER_KEY" -H "content-type: application/json" \
+  -d '{
+        "name": "zn-glm",
+        "members": [
+          {"backend_id": 7, "model": "gpt-6.1-sol"},
+          {"backend_id": 2, "model": "glm-5.3"}
+        ]
+      }'
+```
+
+That single call creates a normal `model_routes` row plus one group endpoint per member:
+
+- The client dialect is always OpenAI Chat (`/v1/chat/completions`). Cross-family members — Codex (`codex_responses`) or Grok OAuth (`openai_responses`) backends — are translated by the router in both directions.
+- Each endpoint's `protocol`/`auth_mode` come from the member backend's provider type (see the registry table above); backends without a provider type default to `openai_chat` + `bearer`, and a member may carry an explicit `{"protocol": ..., "auth_mode": ...}` override.
+- Endpoints on OAuth backends inherit the backend's per-account `oauth:...` reference; API-key backends keep using their own key.
+- `weight` defaults to the member position — 8, 4, 2, then 1 for every later member — under `weighted_round_robin`. An explicit `"weight": N` on a member wins.
+- Policy is fixed: `max_inflight` 4 per member, `first_byte_timeout` 180 s, `chars_per_token` 4.0, enabled on creation.
+
+Rules worth knowing:
+
+- Re-POSTing the same combo name replaces the member list (endpoints and order), but keeps the enabled state. `PATCH /admin/combos/{name}/enabled` owns on/off.
+- A backend can appear at most once — group endpoints are keyed by backend. To serve two accounts of the same provider, create one backend per account (this is how the Codex account pool works).
+- A name that already exists as a manual model route is never hijacked: the call returns 409.
+- Deleting follows the route rules: a combo with usage history returns 409 and should be disabled instead.
+
+Listing replays the definition order (member order is stored on the route row itself, because endpoint rows carry no position):
+
+```bash
+curl -H "x-admin-key: $ADMIN_MASTER_KEY" http://127.0.0.1:8089/admin/combos
+curl -X DELETE -H "x-admin-key: $ADMIN_MASTER_KEY" http://127.0.0.1:8089/admin/combos/zn-glm
+```
+
+Combos appear in `/v1/models` and the routes listing like any other route. Portal support ships next; today they are an API feature.
+
 ## Local OpenAI-compatible endpoint
 
 For llama.cpp, vLLM, LiteLLM, or another local OpenAI-compatible server, choose **Custom LLM** and use a Base URL such as:
