@@ -126,7 +126,7 @@ impl DbConfigLoader {
     async fn load_backends(&self) -> Result<Vec<Backend>> {
         let rows = fetch_rows(
             &self.pool,
-            "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled FROM backends",
+            "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled, dynamic_models FROM backends",
         )
         .await
         .context("load backends")?;
@@ -141,11 +141,14 @@ impl DbConfigLoader {
             let max_inflight = g_i64(&row, 5)?;
             let format = g_str(&row, 6)?;
             let enabled = g_bool(&row, 7)?;
+            let dynamic_models = g_bool(&row, 8)?;
+            let opencode_free = format.eq_ignore_ascii_case("opencode_free");
             let backend_format = match format.as_str() {
                 "openai" => BackendFormat::OpenAi,
                 "anthropic" => BackendFormat::Anthropic,
                 // Marker dialect, not a third wire format: the free tier speaks OpenAI-compatible
-                // JSON; the marker only tells admin probes to send the free-tier identity headers.
+                // JSON; the marker only tells admin probes and the dynamic-catalog fetcher to
+                // send the free-tier identity headers.
                 "opencode_free" => BackendFormat::OpenAi,
                 other => return Err(anyhow!("unknown backend format '{other}' for backend {id}")),
             };
@@ -162,6 +165,8 @@ impl DbConfigLoader {
                 weight: u32::try_from(weight).unwrap_or(1),
                 max_inflight: u32::try_from(max_inflight).unwrap_or(0),
                 format: backend_format,
+                opencode_free,
+                dynamic_models,
                 enabled,
             });
         }
@@ -175,7 +180,7 @@ impl DbConfigLoader {
             "SELECT model_name, backend_ids, fallback_backend_id, chars_per_token, first_byte_timeout, \
              provider_model_name, context_tokens, max_output_tokens, \
              price_input_per_mtok_usd, price_output_per_mtok_usd, enabled, \
-             provider_key_ref, auth_mode, protocol, routing_policy FROM model_routes",
+             provider_key_ref, auth_mode, protocol, routing_policy, passthrough FROM model_routes",
         )
         .await
         .context("load model_routes")?;
@@ -202,6 +207,7 @@ impl DbConfigLoader {
             let protocol_raw = g_str(&row, 13)?;
             let protocol = ProviderProtocol::parse(&protocol_raw).as_str().to_string();
             let routing_policy = RoutingPolicy::parse(&g_str(&row, 14)?);
+            let passthrough = g_bool(&row, 15)?;
             // Resolve route-level credential (nếu có). Khi route không có credential riêng, để
             // provider_key = None; proxy sẽ dùng backend.api_key của backend được chọn tại thời điểm
             // forward (mỗi backend có key riêng, kể cả fallback/secondary).
@@ -228,6 +234,7 @@ impl DbConfigLoader {
                 quota_key,
                 routing_policy,
                 endpoints,
+                passthrough,
             });
         }
         Ok(out)
@@ -521,6 +528,41 @@ mod tests {
         assert!(snap.routes.is_empty());
         assert!(snap.teams.is_empty());
         assert!(snap.keys_by_hash.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_carries_dynamic_catalog_flags_into_the_snapshot(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO backends (id, name, base_url, api_key_ref, format, dynamic_models, enabled) \
+             VALUES (1, 'plain', 'https://api.example.com/v1', 'env:SOME_KEY', 'openai', FALSE, TRUE), \
+                    (2, 'free', 'https://opencode.ai/zen/v1', 'env:SOME_KEY', 'opencode_free', TRUE, TRUE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_routes (model_name, backend_ids, chars_per_token, first_byte_timeout, passthrough) \
+             VALUES ('opencode/free', '[2]', 4.0, 180, TRUE), ('gpt-4o-mini', '[1]', 4.0, 180, FALSE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let loader = DbConfigLoader::new(pool, 5);
+        let snap = loader.load_snapshot().await.expect("load snapshot");
+
+        // The free tier is a marker dialect, not a new wire format: routing stays OpenAI-shaped
+        // while the catalog fetcher still knows to send the free-tier identity headers.
+        let free = snap.backends.get(&2).expect("free backend");
+        assert_eq!(free.format, BackendFormat::OpenAi);
+        assert!(free.opencode_free);
+        assert!(free.dynamic_models);
+        let plain = snap.backends.get(&1).expect("plain backend");
+        assert!(!plain.opencode_free);
+        assert!(!plain.dynamic_models);
+
+        assert!(snap.routes.get("opencode/free").expect("route").passthrough);
+        assert!(!snap.routes.get("gpt-4o-mini").expect("route").passthrough);
     }
 
     #[test]

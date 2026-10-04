@@ -146,6 +146,7 @@ fn router_for(pool: PgPool, snap: brighto_router::contract::ConfigSnapshot) -> H
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
     }));
     Harness { app, quota }
 }

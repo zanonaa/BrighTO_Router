@@ -138,6 +138,7 @@ async fn model_group_weighted_round_robin_three_endpoint_smoke(pool: PgPool) {
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
     });
     let app = brighto_router::handlers::router(state);
 

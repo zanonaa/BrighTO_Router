@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod auth;
 pub mod budget;
+pub mod catalog;
 pub mod config;
 pub mod contract;
 pub mod handlers;
