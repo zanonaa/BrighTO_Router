@@ -324,6 +324,7 @@ async fn model_group_round_robin_rewrites_per_endpoint_provider_model(pool: PgPo
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
     });
     let app = brighto_router::handlers::router(state);
 
@@ -454,6 +455,7 @@ async fn model_group_large_rewrite_preserves_exact_content_length(pool: PgPool) 
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
     });
     let app = brighto_router::handlers::router(state);
 
@@ -818,6 +820,7 @@ async fn build_state_for_route(
         config_ok_at: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         config_err_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         readiness_max_stale_ms: 5_000,
+        dynamic_catalogs: Arc::new(brighto_router::catalog::DynamicCatalogStore::new_default()),
     });
     (state, prx)
 }

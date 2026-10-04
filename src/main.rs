@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use brighto_router::budget::RamBudgetStore;
+use brighto_router::catalog::DynamicCatalogStore;
 use brighto_router::config::DbConfigLoader;
 use brighto_router::contract::{AppState, ConfigSnapshot};
 use brighto_router::handlers;
@@ -24,6 +25,9 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8090";
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const CONFIG_POLL_SECS: u64 = 5;
 const HEALTH_INTERVAL_SECS: u64 = 5;
+/// How often the dynamic model catalog is re-fetched from backends that opt in. Five minutes
+/// bounds how stale `GET /v1/models` and passthrough routing can be for a newly published model.
+const CATALOG_REFRESH_INTERVAL_SECS: u64 = 300;
 
 fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -192,6 +196,16 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         .clone()
         .start_health_loop(client.clone(), Duration::from_secs(HEALTH_INTERVAL_SECS));
 
+    // Dynamic model catalog: GET {base_url}/models cho mọi backend bật dynamic_models, chạy nền
+    // để passthrough routing và GET /v1/models không phụ thuộc tần suất request. Idle an toàn
+    // khi không backend nào bật.
+    let dynamic_catalogs = Arc::new(DynamicCatalogStore::new_default());
+    dynamic_catalogs.clone().start_refresh_loop(
+        cfg.clone(),
+        client.clone(),
+        Duration::from_secs(CATALOG_REFRESH_INTERVAL_SECS),
+    );
+
     // OAuth token refresh: off the request path, same shape as the health loop. Fires
     // `reload_notify` after a successful write so the config loader picks up the new access
     // token immediately rather than on its next 5s tick.
@@ -254,6 +268,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         config_ok_at,
         config_err_at,
         readiness_max_stale_ms,
+        dynamic_catalogs,
     });
 
     let app = handlers::router(app_state);

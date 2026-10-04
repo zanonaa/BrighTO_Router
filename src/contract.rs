@@ -14,6 +14,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use crate::budget::RamBudgetStore;
+use crate::catalog::DynamicCatalogStore;
 use crate::ledger::LedgerSink;
 use crate::metrics::Metrics;
 use crate::quota::{QuotaKey, QuotaStore};
@@ -157,6 +158,13 @@ pub struct Backend {
     pub weight: u32,       // least-load chia cho số này; >= 1
     pub max_inflight: u32, // 0 = không giới hạn
     pub format: BackendFormat,
+    /// DB row carries the `opencode_free` format marker. Not a wire dialect (`format` stays
+    /// OpenAI): it tells the dynamic-catalog fetcher to apply the free-tier identity headers
+    /// when probing `GET {base_url}/models`.
+    pub opencode_free: bool,
+    /// Model list comes live from `GET {base_url}/models` (background refresher + on-miss
+    /// refresh) so passthrough routes can match models the route table does not name.
+    pub dynamic_models: bool,
     pub enabled: bool,
     /// Registry slug (vd "deepseek") khi backend được tạo từ `src/provider_registry`.
     /// None = backend thường, mọi giá trị do caller cung cấp (backward-compat).
@@ -180,6 +188,8 @@ impl std::fmt::Debug for Backend {
             .field("weight", &self.weight)
             .field("max_inflight", &self.max_inflight)
             .field("format", &self.format)
+            .field("opencode_free", &self.opencode_free)
+            .field("dynamic_models", &self.dynamic_models)
             .field("enabled", &self.enabled)
             .field("provider_type", &self.provider_type)
             .field("protocol", &self.protocol)
@@ -278,6 +288,11 @@ pub struct ModelRoute {
     pub routing_policy: RoutingPolicy,
     /// Per-backend endpoint overrides for true mixed-provider groups. Empty keeps legacy single-endpoint behavior.
     pub endpoints: HashMap<i64, ModelEndpoint>,
+    /// Passthrough: match any model present in the (single) backend's dynamic catalog, not
+    /// just the row's own model_name. The row supplies protocol/auth/pricing; the matched
+    /// model name becomes the provider model name. Admin validation keeps it single-backend,
+    /// endpoint-free and on a chat/responses-family protocol.
+    pub passthrough: bool,
 }
 
 impl ModelRoute {
@@ -449,6 +464,10 @@ pub struct AppState {
     pub quota: Arc<QuotaStore>,
     /// Admin gọi notify_one() sau mutation -> poll task reload ngay (không chờ 5s).
     pub reload_notify: Arc<tokio::sync::Notify>,
+    /// Live model catalogs of `dynamic_models` backends. Written by the background refresher
+    /// and the bounded on-miss refresh; read (never across an .await) by the passthrough
+    /// fallback on the request path and by the /v1/models union.
+    pub dynamic_catalogs: Arc<DynamicCatalogStore>,
     /// epoch ms lần cuối config reload THÀNH CÔNG / THẤT BẠI — cho /readyz (control-plane, không hot path).
     pub config_ok_at: Arc<AtomicU64>,
     pub config_err_at: Arc<AtomicU64>,

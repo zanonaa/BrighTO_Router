@@ -933,6 +933,8 @@ mod tests {
             weight,
             max_inflight,
             format: BackendFormat::OpenAi,
+            opencode_free: false,
+            dynamic_models: false,
             enabled,
             provider_type: None,
             protocol: String::new(),
@@ -989,6 +991,7 @@ mod tests {
             oauth_account_id: None,
             quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
+            passthrough: false,
             endpoints: std::collections::HashMap::new(),
         }
     }
@@ -1138,6 +1141,7 @@ mod tests {
             oauth_account_id: None,
             quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
+            passthrough: false,
             endpoints: std::collections::HashMap::new(),
         }
     }

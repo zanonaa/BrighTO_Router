@@ -309,6 +309,7 @@ pub fn router(runtime: Arc<AppState>) -> Router {
         )
         .route("/backends/{id}/key", put(put_backend_key))
         .route("/backends/{id}/models", get(fetch_backend_models))
+        .route("/backends/{id}/models-catalog", get(backend_models_catalog))
         .route("/routes", get(list_routes).post(upsert_route))
         .route("/routes/preview-models", post(preview_models))
         .route("/provider-catalog", get(list_provider_catalog))
@@ -425,6 +426,8 @@ struct BackendResponse {
     weight: i64,
     max_inflight: i64,
     format: String,
+    /// Model list fetched live from GET {base_url}/models (dynamic catalog).
+    dynamic_models: bool,
     enabled: bool,
     /// Registry slug khi backend được tạo từ provider registry (null = backend thường).
     provider_type: Option<String>,
@@ -446,6 +449,8 @@ struct PatchBackend {
     weight: Option<u32>,
     max_inflight: Option<u32>,
     format: Option<String>,
+    /// Bật/tắt dynamic catalog: model list luôn lấy từ GET {base_url}/models.
+    dynamic_models: Option<bool>,
     enabled: Option<bool>,
 }
 
@@ -473,6 +478,9 @@ struct CreateBackend {
     key: Option<String>,
     weight: Option<u32>,
     max_inflight: Option<u32>,
+    /// Bật dynamic catalog ngay khi tạo backend.
+    #[serde(default)]
+    dynamic_models: bool,
     #[serde(default = "default_enabled")]
     enabled: bool,
 }
@@ -655,6 +663,9 @@ struct UpsertRoute {
     routing_policy: Option<String>,
     /// Optional endpoint overrides for Model Group load balancing. Omitted = keep existing endpoint rows.
     endpoints: Option<Vec<UpsertRouteEndpoint>>,
+    /// Passthrough: route mọi model có trong dynamic catalog của backend (đúng 1 backend),
+    /// không chỉ model_name của row này. Protocol/auth/pricing lấy từ row.
+    passthrough: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -711,6 +722,8 @@ struct RouteResponse {
     auth_mode: String,
     protocol: String,
     routing_policy: String,
+    /// Passthrough route (dynamic catalog matching); hiện trong listing như route thường.
+    passthrough: bool,
     endpoints: Vec<RouteEndpointResponse>,
     /// route.enabled && có ít nhất 1 backend tham chiếu enabled.
     effective_enabled: bool,
@@ -880,7 +893,9 @@ fn non_empty_trimmed(value: String, field: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_owned())
 }
 
-fn join_provider_url(base_url: &str, route: &str) -> String {
+/// Join base_url + route path. Shared by admin probes and the dynamic-catalog fetcher:
+/// một base_url đã có path prefix (vd .../v1) chỉ nhận /models, không lặp /v1.
+pub(crate) fn join_provider_url(base_url: &str, route: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     let has_path_prefix = trimmed
         .split_once("://")
@@ -1023,7 +1038,7 @@ async fn list_routes_from_pool(pool: &PgPool) -> Result<Vec<RouteResponse>, ApiE
     let rows = sqlx::query::<sqlx::Postgres>(
         "SELECT model_name, backend_ids, fallback_backend_id, chars_per_token, first_byte_timeout, \
          provider_model_name, context_tokens, max_output_tokens, \
-         price_input_per_mtok_usd, price_output_per_mtok_usd, enabled, provider_key_ref, auth_mode, protocol, routing_policy \
+         price_input_per_mtok_usd, price_output_per_mtok_usd, enabled, provider_key_ref, auth_mode, protocol, routing_policy, passthrough \
          FROM model_routes ORDER BY model_name",
     )
     .fetch_all(pool)
@@ -1073,6 +1088,7 @@ async fn list_routes_from_pool(pool: &PgPool) -> Result<Vec<RouteResponse>, ApiE
             auth_mode: row.try_get("auth_mode")?,
             protocol: row.try_get("protocol")?,
             routing_policy: row.try_get("routing_policy")?,
+            passthrough: row.try_get("passthrough")?,
             endpoints,
             effective_enabled,
             disabled_reason,
@@ -1090,12 +1106,13 @@ async fn create_backend(
     Json(payload): Json<CreateBackend>,
 ) -> Result<Json<BackendResponse>, ApiError> {
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
+    let dynamic_models = payload.dynamic_models;
     let resolved = resolve_backend_create(payload)?;
     let pool = state.pool().await?;
     let provider_slug: Option<&str> = resolved.provider_type.map(|p| p.slug);
     let row = sqlx::query::<sqlx::Postgres>(
-        "INSERT INTO backends (name, base_url, api_key_ref, weight, max_inflight, format, enabled, provider_type) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+        "INSERT INTO backends (name, base_url, api_key_ref, weight, max_inflight, format, dynamic_models, enabled, provider_type) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(&resolved.name)
     .bind(&resolved.base_url)
@@ -1103,6 +1120,7 @@ async fn create_backend(
     .bind(resolved.weight as i64)
     .bind(resolved.max_inflight as i64)
     .bind(resolved.format)
+    .bind(dynamic_models)
     .bind(resolved.enabled)
     .bind(provider_slug)
     .fetch_one(pool)
@@ -1137,6 +1155,7 @@ async fn create_backend(
         weight: resolved.weight as i64,
         max_inflight: resolved.max_inflight as i64,
         format: resolved.format.to_string(),
+        dynamic_models,
         enabled: resolved.enabled,
         provider_type: provider_slug.map(str::to_owned),
         active_route_count: 0,
@@ -1154,7 +1173,7 @@ async fn list_backends(
     check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
     let pool = state.pool().await?;
     let rows = sqlx::query::<sqlx::Postgres>(
-        "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, enabled, provider_type FROM backends ORDER BY id",
+        "SELECT id, name, base_url, api_key_ref, weight, max_inflight, format, dynamic_models, enabled, provider_type FROM backends ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -1193,6 +1212,7 @@ async fn list_backends(
             weight: row.try_get("weight")?,
             max_inflight: row.try_get("max_inflight")?,
             format: row.try_get("format")?,
+            dynamic_models: row.try_get("dynamic_models")?,
             enabled: row.try_get("enabled")?,
             provider_type,
             active_route_count,
@@ -1318,6 +1338,13 @@ async fn update_backend(
         builder
             .push("format = ")
             .push_bind(normalize_backend_format(&format)?);
+        first = false;
+    }
+    if let Some(dynamic_models) = payload.dynamic_models {
+        if !first {
+            builder.push(", ");
+        }
+        builder.push("dynamic_models = ").push_bind(dynamic_models);
         first = false;
     }
     if let Some(enabled) = payload.enabled {
@@ -1510,6 +1537,47 @@ async fn fetch_backend_models(
         backend_id: id,
         backend_name: name,
         models,
+    }))
+}
+
+/// Trạng thái catalog động của một backend (last-known, không gọi upstream): id model đang
+/// biết, thời điểm fetch thành công gần nhất, kết quả lần fetch cuối. Cho Portal/debug.
+#[derive(Serialize)]
+struct BackendCatalogResponse {
+    backend_id: i64,
+    ids: Vec<String>,
+    /// Epoch ms của lần fetch THÀNH CÔNG tạo ra `ids` (0 = chưa từng fetch thành công).
+    fetched_at_ms: u64,
+    /// Kết quả lần fetch cuối cùng (false giữ nguyên ids cũ).
+    ok: bool,
+    /// Backend có bật dynamic catalog không.
+    dynamic_models: bool,
+}
+
+async fn backend_models_catalog(
+    Extension(state): Extension<Arc<AdminState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<BackendCatalogResponse>, ApiError> {
+    check_admin_auth(&state.master_key, &state.allow_cidrs, &headers, peer.ip())?;
+    let pool = state.pool().await?;
+    let row = sqlx::query::<sqlx::Postgres>("SELECT dynamic_models FROM backends WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("backend not found"))?;
+    let dynamic_models: bool = row.try_get("dynamic_models")?;
+    let catalog = state.runtime.dynamic_catalogs.catalog(id);
+    Ok(Json(BackendCatalogResponse {
+        backend_id: id,
+        ids: catalog
+            .as_ref()
+            .map(|c| c.model_ids.iter().cloned().collect())
+            .unwrap_or_default(),
+        fetched_at_ms: catalog.as_ref().map_or(0, |c| c.fetched_at_ms),
+        ok: catalog.as_ref().is_some_and(|c| c.ok),
+        dynamic_models,
     }))
 }
 
@@ -2360,7 +2428,22 @@ struct ValidatedRoute {
     auth_mode: String,
     protocol: String,
     routing_policy: RoutingPolicy,
+    passthrough: bool,
     endpoints: Option<Vec<ValidatedRouteEndpoint>>,
+}
+
+/// Passthrough routes define the wire for every model they match, so the protocol must be one
+/// the router forwards generically: a chat-family or responses-family protocol. Rerank/ASR/
+/// embeddings/systemone shapes need per-model knowledge and stay explicit-route-only.
+fn is_passthrough_protocol(protocol: &str) -> bool {
+    matches!(
+        ProviderProtocol::parse(protocol),
+        ProviderProtocol::OpenAiChat
+            | ProviderProtocol::LocalOpenAiChat
+            | ProviderProtocol::CustomOpenAiChat
+            | ProviderProtocol::OpenAiResponses
+            | ProviderProtocol::CodexResponses
+    )
 }
 
 fn protocol_family(protocol: &str) -> &'static str {
@@ -2532,6 +2615,43 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
             None => "openai_chat".to_string(),
         },
     };
+    // Passthrough: đúng 1 backend, không fallback, không group endpoints, không cần
+    // provider_model_name (model client gọi chính là provider model khi match), protocol
+    // phải thuộc chat/responses family vì nó định nghĩa wire cho mọi model được match.
+    let passthrough = payload.passthrough.unwrap_or(false);
+    if passthrough {
+        if payload.backend_ids.len() != 1 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passthrough route must have exactly one backend_id",
+            ));
+        }
+        if payload.fallback_backend_id.is_some() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passthrough route must not set fallback_backend_id",
+            ));
+        }
+        if payload
+            .endpoints
+            .as_ref()
+            .is_some_and(|endpoints| !endpoints.is_empty())
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passthrough route must not declare group endpoints",
+            ));
+        }
+        if !is_passthrough_protocol(&protocol) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "passthrough route protocol must be a chat-family or responses-family \
+                     protocol (e.g. openai_chat, openai_responses), got: {protocol}"
+                ),
+            ));
+        }
+    }
     // Ghi provider key (plaintext) ra file secrets nếu được cung cấp; chỉ lưu ref.
     let provider_key_ref = match payload
         .provider_key
@@ -2733,6 +2853,7 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
         auth_mode,
         protocol,
         routing_policy,
+        passthrough,
         endpoints,
     })
 }
@@ -2754,6 +2875,7 @@ fn route_response(v: ValidatedRoute) -> RouteResponse {
         auth_mode: v.auth_mode,
         protocol: v.protocol,
         routing_policy: v.routing_policy.as_str().to_string(),
+        passthrough: v.passthrough,
         endpoints: v
             .endpoints
             .unwrap_or_default()
@@ -2850,8 +2972,8 @@ async fn upsert_route(
     sqlx::query::<sqlx::Postgres>(
         "INSERT INTO model_routes (model_name, backend_ids, fallback_backend_id, chars_per_token, first_byte_timeout, \
          provider_model_name, context_tokens, max_output_tokens, \
-         price_input_per_mtok_usd, price_output_per_mtok_usd, enabled, provider_key_ref, auth_mode, protocol, routing_policy) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+         price_input_per_mtok_usd, price_output_per_mtok_usd, enabled, provider_key_ref, auth_mode, protocol, routing_policy, passthrough) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(&v.model_name)
     .bind(&v.backend_ids_json)
@@ -2868,6 +2990,7 @@ async fn upsert_route(
     .bind(&v.auth_mode)
     .bind(&v.protocol)
     .bind(v.routing_policy.as_str())
+    .bind(v.passthrough)
     .execute(pool)
     .await?;
     replace_route_endpoints(pool, &v.model_name, v.endpoints.as_deref()).await?;
@@ -2925,7 +3048,7 @@ async fn patch_route(
          context_tokens = $7, max_output_tokens = $8, price_input_per_mtok_usd = $9, \
          price_output_per_mtok_usd = $10, enabled = $11, \
          provider_key_ref = COALESCE($12, provider_key_ref), auth_mode = $13, \
-         protocol = $14, routing_policy = $15 WHERE model_name = $16",
+         protocol = $14, routing_policy = $15, passthrough = $16 WHERE model_name = $17",
     )
     .bind(&v.model_name)
     .bind(&v.backend_ids_json)
@@ -2942,6 +3065,7 @@ async fn patch_route(
     .bind(&v.auth_mode)
     .bind(&v.protocol)
     .bind(v.routing_policy.as_str())
+    .bind(v.passthrough)
     .bind(&old_name)
     .execute(pool)
     .await?;
@@ -4261,6 +4385,10 @@ mod tests {
         .bind(90_i64)
         .execute(&pool)
         .await?;
+        sqlx::query("UPDATE model_routes SET passthrough = TRUE WHERE model_name = $1")
+            .bind("a-model")
+            .execute(&pool)
+            .await?;
 
         let routes = list_routes_from_pool(&pool).await.expect("list routes");
         assert_eq!(routes.len(), 2);
@@ -4272,7 +4400,122 @@ mod tests {
         assert_eq!(routes[1].model_name, "z-model");
         assert_eq!(routes[1].backend_ids, vec![2, 3]);
         assert_eq!(routes[1].fallback_backend_id, Some(3));
+        // Passthrough flag must survive the listing query: operators need to see which rows
+        // widen the served model set.
+        assert!(routes[0].passthrough);
+        assert!(!routes[1].passthrough);
         Ok(())
+    }
+
+    fn route_payload_with(passthrough: bool) -> UpsertRoute {
+        UpsertRoute {
+            model_name: "opencode/free".to_string(),
+            backend_ids: vec![7],
+            fallback_backend_id: None,
+            chars_per_token: None,
+            first_byte_timeout: None,
+            provider_model_name: None,
+            context_tokens: None,
+            max_output_tokens: None,
+            price_input_per_mtok_usd: None,
+            price_output_per_mtok_usd: None,
+            enabled: None,
+            provider_key: None,
+            provider_key_ref: None,
+            auth_mode: None,
+            protocol: None,
+            routing_policy: None,
+            endpoints: None,
+            passthrough: Some(passthrough),
+        }
+    }
+
+    #[test]
+    fn passthrough_route_needs_one_backend_and_a_generic_wire_protocol() {
+        let validated =
+            validate_route(route_payload_with(true)).expect("passthrough route is valid");
+        assert!(validated.passthrough);
+        assert_eq!(validated.backend_ids, vec![7]);
+        // provider_model_name stays defaulted: the matching model id *is* the provider model.
+        assert_eq!(validated.provider_model_name, "opencode/free");
+        assert_eq!(validated.protocol, "openai_chat");
+
+        let mut two_backends = route_payload_with(true);
+        two_backends.backend_ids = vec![7, 8];
+        let Err(e) = validate_route(two_backends) else {
+            panic!("two backends must be rejected");
+        };
+        assert!(e.message.contains("exactly one backend_id"));
+
+        let mut with_fallback = route_payload_with(true);
+        with_fallback.fallback_backend_id = Some(9);
+        let Err(e) = validate_route(with_fallback) else {
+            panic!("fallback must be rejected");
+        };
+        assert!(e.message.contains("must not set fallback_backend_id"));
+
+        let mut with_endpoints = route_payload_with(true);
+        with_endpoints.endpoints = Some(vec![UpsertRouteEndpoint {
+            backend_id: 7,
+            provider_model_name: None,
+            provider_key: None,
+            provider_key_ref: None,
+            auth_mode: None,
+            protocol: None,
+            weight: None,
+            max_inflight: None,
+            enabled: None,
+        }]);
+        let Err(e) = validate_route(with_endpoints) else {
+            panic!("group endpoints must be rejected");
+        };
+        assert!(e.message.contains("must not declare group endpoints"));
+
+        for protocol in ["anthropic_messages", "openai_embeddings", "cohere_rerank"] {
+            let mut wrong_wire = route_payload_with(true);
+            wrong_wire.protocol = Some(protocol.to_string());
+            let Err(e) = validate_route(wrong_wire) else {
+                panic!("protocol {protocol} must be rejected for passthrough");
+            };
+            assert!(e.message.contains("chat-family or responses-family"));
+        }
+
+        let mut responses = route_payload_with(true);
+        responses.protocol = Some("openai_responses".to_string());
+        assert_eq!(
+            validate_route(responses)
+                .expect("responses is allowed")
+                .protocol,
+            "openai_responses"
+        );
+    }
+
+    #[test]
+    fn plain_route_keeps_multi_backend_validation_and_passthrough_flag_off() {
+        let mut plain = route_payload_with(false);
+        plain.backend_ids = vec![7, 8];
+        let validated = validate_route(plain).expect("plain multi-backend route");
+        assert!(!validated.passthrough);
+        assert_eq!(validated.backend_ids, vec![7, 8]);
+
+        // Passthrough omitted entirely behaves like `false`.
+        let mut omitted = route_payload_with(true);
+        omitted.passthrough = None;
+        assert!(!validate_route(omitted).expect("omitted flag").passthrough);
+    }
+
+    #[test]
+    fn passthrough_protocol_gate_covers_only_generic_families() {
+        assert!(is_passthrough_protocol("openai_chat"));
+        assert!(is_passthrough_protocol("local_openai_chat"));
+        assert!(is_passthrough_protocol("custom_openai_chat"));
+        assert!(is_passthrough_protocol("openai_responses"));
+        assert!(is_passthrough_protocol("codex_responses"));
+        assert!(!is_passthrough_protocol("openai_completions"));
+        assert!(!is_passthrough_protocol("anthropic_messages"));
+        assert!(!is_passthrough_protocol("openai_embeddings"));
+        assert!(!is_passthrough_protocol("qwen_rerank"));
+        assert!(!is_passthrough_protocol("openai_audio_transcriptions"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4340,6 +4583,7 @@ mod tests {
 
     fn legacy_backend_payload() -> CreateBackend {
         CreateBackend {
+            dynamic_models: false,
             name: "legacy".into(),
             base_url: Some("https://api.example.com".into()),
             api_key_ref: Some("env:EXAMPLE_API_KEY".into()),
@@ -4394,6 +4638,7 @@ mod tests {
     fn provider_type_derives_base_url_format_and_defaults() {
         let payload = CreateBackend {
             name: "ds".into(),
+            dynamic_models: false,
             provider_type: Some("deepseek".into()),
             key: Some("sk-deepseek".into()),
             ..legacy_backend_payload()
@@ -4411,6 +4656,7 @@ mod tests {
     fn fixed_base_url_entries_override_a_conflicting_caller_base_url() {
         let mut payload = CreateBackend {
             name: "zai".into(),
+            dynamic_models: false,
             provider_type: Some("ZAI".into()), // case-insensitive slug
             key: Some("sk-zai".into()),
             ..legacy_backend_payload()
@@ -4426,6 +4672,7 @@ mod tests {
     fn unknown_provider_type_is_rejected_with_400() {
         let payload = CreateBackend {
             name: "x".into(),
+            dynamic_models: false,
             provider_type: Some("definitely-not-a-provider".into()),
             key: Some("sk-x".into()),
             ..legacy_backend_payload()
@@ -4443,6 +4690,7 @@ mod tests {
     fn custom_openai_requires_a_caller_base_url() {
         let mut payload = CreateBackend {
             name: "local".into(),
+            dynamic_models: false,
             provider_type: Some("custom-openai".into()),
             base_url: None,
             api_key_ref: None,
@@ -4474,6 +4722,7 @@ mod tests {
         let payload = CreateBackend {
             name: "dahl".into(),
             provider_type: Some("dahl".into()),
+            dynamic_models: false,
             key: None,
             api_key_ref: None,
             base_url: None,
@@ -4494,6 +4743,7 @@ mod tests {
             name: "zai".into(),
             provider_type: Some("zai".into()),
             api_key_ref: Some("env:ZAI_API_KEY".into()),
+            dynamic_models: false,
             key: None,
             base_url: None,
             format: None,
@@ -4513,6 +4763,7 @@ mod tests {
             provider_type: Some("codex-oauth".into()),
             key: Some("sk-not-how-oauth-works".into()),
             base_url: None,
+            dynamic_models: false,
             api_key_ref: None,
             format: None,
             weight: None,
@@ -4529,6 +4780,7 @@ mod tests {
         // The connected account is attached later (oauth:<provider>:<label> ref), so creating
         // the backend row itself needs no credential.
         let payload = CreateBackend {
+            dynamic_models: false,
             name: "grok".into(),
             provider_type: Some("xai-grok-oauth".into()),
             api_key_ref: Some("oauth:xai-oauth:default".into()),

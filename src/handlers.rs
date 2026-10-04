@@ -1,6 +1,7 @@
 //! Glue layer: axum router + pipeline auth -> body -> budget -> concurrency -> proxy.
 //! Hot path không lock, không đọc disk/env, không parse full body (chỉ struct 2 field model+stream).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -17,9 +18,12 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::auth;
+use crate::catalog::DynamicCatalogStore;
 #[cfg(test)]
 use crate::contract::RoutingPolicy;
-use crate::contract::{ApiKey, AppState, BudgetError, ModelRoute, ProviderProtocol};
+use crate::contract::{
+    ApiKey, AppState, Backend, BudgetError, ConfigSnapshot, ModelRoute, ProviderProtocol,
+};
 use crate::proxy::{self, ProxyContext, ProxyRequestBody};
 
 /// Chỉ parse field top-level, bỏ qua toàn bộ phần còn lại (không cấp phát cho skipped fields).
@@ -385,17 +389,58 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
 async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.cfg.load_full();
-    (StatusCode::OK, axum::Json(models_list_payload(&cfg.routes)))
+    (
+        StatusCode::OK,
+        axum::Json(models_list_payload(
+            &cfg.routes,
+            &cfg.backends,
+            &state.dynamic_catalogs,
+        )),
+    )
 }
 
-/// `/v1/models` chỉ liệt kê route đang bật; route disabled không được quảng bá cho client.
+/// `/v1/models` liệt kê route đang bật, hợp nhất với catalog động của các backend dynamic_models
+/// có ít nhất một route passthrough đang bật (bare id, không prefix; route thắng khi trùng tên).
+/// Route disabled không được quảng bá cho client; tên placeholder của route passthrough cũng
+/// không — model thật nằm trong catalog của backend.
 fn models_list_payload(
-    routes: &std::collections::HashMap<String, ModelRoute>,
+    routes: &HashMap<String, ModelRoute>,
+    backends: &HashMap<i64, Backend>,
+    catalogs: &DynamicCatalogStore,
 ) -> serde_json::Value {
-    let data: Vec<serde_json::Value> = routes
+    let mut ids: Vec<String> = routes
         .iter()
-        .filter(|(_, route)| route.enabled)
-        .map(|(m, _)| serde_json::json!({"id": m, "object": "model"}))
+        // Passthrough routes carry no model of their own — their backend's catalog
+        // provides the real ids below.
+        .filter(|(_, route)| route.enabled && !route.passthrough)
+        .map(|(model, _)| model.clone())
+        .collect();
+    let mut passthrough_backend_ids: Vec<i64> = routes
+        .values()
+        .filter(|route| route.passthrough && route.enabled)
+        .filter_map(|route| route.backend_ids.first().copied())
+        .collect();
+    passthrough_backend_ids.sort_unstable();
+    passthrough_backend_ids.dedup();
+    for backend_id in passthrough_backend_ids {
+        let serves_catalog = backends
+            .get(&backend_id)
+            .is_some_and(|b| b.enabled && b.dynamic_models);
+        if !serves_catalog {
+            continue;
+        }
+        if let Some(catalog_ids) = catalogs.model_ids(backend_id) {
+            for id in catalog_ids {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids.sort();
+    let data: Vec<serde_json::Value> = ids
+        .into_iter()
+        .map(|m| serde_json::json!({"id": m, "object": "model"}))
         .collect();
     serde_json::json!({ "object": "list", "data": data })
 }
@@ -514,8 +559,9 @@ async fn handle_generate(
         );
     }
 
-    // 4. Route.
-    let Some(route) = snapshot.routes.get(model).cloned() else {
+    // 4. Route. Exact table match first; a miss falls back to passthrough routes backed by a
+    // dynamic catalog that contains the model.
+    let Some(route) = resolve_route(&state, &snapshot, model).await else {
         return build_error(&request_id, StatusCode::NOT_FOUND, "model not configured");
     };
     if !route.enabled {
@@ -767,7 +813,7 @@ async fn handle_multipart_adapter(
         );
     }
 
-    let Some(route) = snapshot.routes.get(model).cloned() else {
+    let Some(route) = resolve_route(&state, &snapshot, model).await else {
         return build_error(&request_id, StatusCode::NOT_FOUND, "model not configured");
     };
     if !route.enabled {
@@ -870,6 +916,112 @@ async fn handle_multipart_adapter(
     };
     let req = Request::from_parts(parts, ProxyRequestBody::Buffered(body));
     proxy::proxy_forward(state, req, ctx).await
+}
+
+// ===== Passthrough fallback (dynamic model catalog) =====
+
+/// Route cho một model: exact match bảng route trước; miss thì thử các route passthrough
+/// (backend có catalog động chứa model này). Không có route passthrough nào -> bằng đúng
+/// behaviour cũ (404 ngay, zero extra work).
+async fn resolve_route(
+    state: &AppState,
+    snapshot: &ConfigSnapshot,
+    model: &str,
+) -> Option<ModelRoute> {
+    if let Some(route) = snapshot.routes.get(model) {
+        return Some(route.clone());
+    }
+    resolve_passthrough_route(state, snapshot, model).await
+}
+
+/// Passthrough candidates: enabled passthrough routes với đúng 1 backend, sắp xếp theo tên
+/// route để "first match wins" luôn deterministic (HashMap iteration order là không ổn định).
+fn passthrough_candidates(snapshot: &ConfigSnapshot) -> Vec<&ModelRoute> {
+    let mut candidates: Vec<&ModelRoute> = snapshot
+        .routes
+        .values()
+        .filter(|route| route.passthrough && route.enabled && route.backend_ids.len() == 1)
+        .collect();
+    candidates.sort_unstable_by(|a, b| a.model_name.cmp(&b.model_name));
+    candidates
+}
+
+/// Pure match: candidate đầu tiên (stable order) mà backend của nó enabled + dynamic_models và
+/// catalog động đang chứa model. Route tổng hợp mang protocol/auth/key của route passthrough,
+/// provider_model_name = model client gọi (catalog upstream chính là bảng model của provider).
+fn match_passthrough(
+    candidates: &[&ModelRoute],
+    backends: &HashMap<i64, Backend>,
+    catalogs: &DynamicCatalogStore,
+    model: &str,
+) -> Option<ModelRoute> {
+    candidates.iter().find_map(|route| {
+        let backend_id = route.backend_ids[0];
+        let backend = backends.get(&backend_id)?;
+        if !backend.enabled || !backend.dynamic_models || !catalogs.contains(backend_id, model) {
+            return None;
+        }
+        let mut resolved = (*route).clone();
+        resolved.model_name = model.to_string();
+        resolved.provider_model_name = model.to_string();
+        resolved.endpoints.clear();
+        Some(resolved)
+    })
+}
+
+/// Backends mà on-miss refresh cần chạm: các backend dynamic_models + enabled được tham chiếu
+/// bởi route passthrough đang bật (dedup, thứ tự ổn định).
+fn passthrough_refresh_targets(
+    snapshot: &ConfigSnapshot,
+    candidates: &[&ModelRoute],
+) -> Vec<Backend> {
+    let mut backend_ids: Vec<i64> = candidates
+        .iter()
+        .filter_map(|route| route.backend_ids.first().copied())
+        .collect();
+    backend_ids.sort_unstable();
+    backend_ids.dedup();
+    backend_ids
+        .into_iter()
+        .filter_map(|id| snapshot.backends.get(&id))
+        .filter(|backend| backend.enabled && backend.dynamic_models)
+        .cloned()
+        .collect()
+}
+
+/// Resolve một route passthrough cho model chưa có route tường minh. Miss toàn bộ catalog mà
+/// có catalog nào già hơn ngưỡng -> ONE bounded synchronous refresh (chống stampede bằng claim
+/// trong store) rồi retry match trước khi chịu 404.
+async fn resolve_passthrough_route(
+    state: &AppState,
+    snapshot: &ConfigSnapshot,
+    model: &str,
+) -> Option<ModelRoute> {
+    let candidates = passthrough_candidates(snapshot);
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(route) = match_passthrough(
+        &candidates,
+        &snapshot.backends,
+        &state.dynamic_catalogs,
+        model,
+    ) {
+        return Some(route);
+    }
+    let targets = passthrough_refresh_targets(snapshot, &candidates);
+    if !targets.is_empty() {
+        let _ = state
+            .dynamic_catalogs
+            .refresh_on_miss(state.client.clone(), &targets, now_ms())
+            .await;
+    }
+    match_passthrough(
+        &candidates,
+        &snapshot.backends,
+        &state.dynamic_catalogs,
+        model,
+    )
 }
 
 fn extract_multipart_text_field(body: &[u8], field: &str) -> Option<String> {
@@ -1056,6 +1208,7 @@ fn rewrite_model_field(body: &[u8], new_model: &str) -> Option<Vec<u8>> {
         quota_key: None,
         routing_policy: RoutingPolicy::LeastLoadedWeighted,
         endpoints: std::collections::HashMap::new(),
+        passthrough: false,
     };
     rewrite_json_proxy_body(body, &route, ProviderProtocol::OpenAiChat)
 }
@@ -1166,7 +1319,322 @@ mod tests {
             quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
+            passthrough: false,
         }
+    }
+
+    fn passthrough_route_for_test(name: &str, backend_id: i64) -> ModelRoute {
+        ModelRoute {
+            model_name: name.to_string(),
+            backend_ids: vec![backend_id],
+            passthrough: true,
+            ..route_for_test(name)
+        }
+    }
+
+    fn dynamic_backend_for_test(id: i64, enabled: bool) -> Backend {
+        Backend {
+            id,
+            name: format!("dynamic-{id}"),
+            base_url: format!("http://127.0.0.1:9{id}00"),
+            api_key_ref: String::new(),
+            api_key: None,
+            weight: 1,
+            max_inflight: 0,
+            format: crate::contract::BackendFormat::OpenAi,
+            opencode_free: false,
+            dynamic_models: true,
+            enabled,
+            provider_type: None,
+            protocol: String::new(),
+            auth_mode: String::new(),
+        }
+    }
+
+    fn passthrough_snapshot(routes: Vec<ModelRoute>, backends: Vec<Backend>) -> ConfigSnapshot {
+        let mut snapshot = ConfigSnapshot::default();
+        for route in routes {
+            snapshot.routes.insert(route.model_name.clone(), route);
+        }
+        for backend in backends {
+            snapshot.backends.insert(backend.id, backend);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn models_list_hides_disabled_routes() {
+        let mut enabled = route_for_test("enabled-backend-model");
+        enabled.model_name = "public-on".to_string();
+        let mut disabled = route_for_test("disabled-backend-model");
+        disabled.model_name = "public-off".to_string();
+        disabled.enabled = false;
+        let routes = std::collections::HashMap::from([
+            ("public-on".to_string(), enabled),
+            ("public-off".to_string(), disabled),
+        ]);
+
+        let payload = models_list_payload(
+            &routes,
+            &HashMap::new(),
+            &DynamicCatalogStore::new_default(),
+        );
+        assert_eq!(payload["object"], "list");
+        let data = payload["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "disabled route must be hidden");
+        assert_eq!(data[0]["id"], "public-on");
+        assert_eq!(data[0]["object"], "model");
+    }
+
+    #[test]
+    fn models_list_unions_dynamic_catalogs_of_passthrough_backends() {
+        let regular = {
+            let mut r = route_for_test("pinned-model");
+            r.model_name = "pinned-model".to_string();
+            r
+        };
+        let passthrough = passthrough_route_for_test("free-passthrough", 7);
+        let catalog_backend = dynamic_backend_for_test(7, true);
+        let mut plain_backend = dynamic_backend_for_test(8, true);
+        plain_backend.dynamic_models = false; // dynamic backend with NO passthrough route
+        let snapshot = passthrough_snapshot(
+            vec![regular, passthrough],
+            vec![catalog_backend, plain_backend],
+        );
+
+        let catalogs = DynamicCatalogStore::new_default();
+        catalogs.apply_fetch(
+            7,
+            Ok(vec![
+                "rotating-free-model".to_string(),
+                "pinned-model".to_string(), // collides with a route: the route wins
+            ]),
+            1_000,
+        );
+        catalogs.apply_fetch(8, Ok(vec!["must-not-appear".to_string()]), 1_000);
+
+        let payload = models_list_payload(&snapshot.routes, &snapshot.backends, &catalogs);
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["pinned-model", "rotating-free-model"],
+            "route ids union catalog ids, deduped, route wins on collision; catalogs without \
+             an enabled passthrough route stay hidden"
+        );
+    }
+
+    #[test]
+    fn models_list_excludes_disabled_passthrough_routes_and_disabled_backends() {
+        let mut passthrough = passthrough_route_for_test("free-passthrough", 7);
+        passthrough.enabled = false;
+        let disabled_backend = passthrough_route_for_test("free-passthrough-2", 9);
+        let mut backend9 = dynamic_backend_for_test(9, false); // backend disabled
+        backend9.dynamic_models = true;
+        let snapshot = passthrough_snapshot(
+            vec![passthrough, disabled_backend],
+            vec![dynamic_backend_for_test(7, true), backend9],
+        );
+        let catalogs = DynamicCatalogStore::new_default();
+        catalogs.apply_fetch(7, Ok(vec!["hidden-no-enabled-route".to_string()]), 1);
+        catalogs.apply_fetch(9, Ok(vec!["hidden-disabled-backend".to_string()]), 1);
+
+        let payload = models_list_payload(&snapshot.routes, &snapshot.backends, &catalogs);
+        assert!(
+            payload["data"].as_array().unwrap().is_empty(),
+            "disabled passthrough route and disabled backend must not leak catalog ids; a \
+             passthrough row's own name is never advertised"
+        );
+    }
+
+    #[test]
+    fn passthrough_match_hits_when_the_catalog_contains_the_model() {
+        let first = passthrough_route_for_test("a-free", 7);
+        let second = passthrough_route_for_test("b-free", 8);
+        let snapshot = passthrough_snapshot(
+            vec![first.clone(), second],
+            vec![
+                dynamic_backend_for_test(7, true),
+                dynamic_backend_for_test(8, true),
+            ],
+        );
+        let catalogs = DynamicCatalogStore::new_default();
+        catalogs.apply_fetch(7, Ok(vec!["qwen3-coder".to_string()]), 1_000);
+        catalogs.apply_fetch(8, Ok(vec!["qwen3-coder".to_string()]), 1_000);
+        let candidates = passthrough_candidates(&snapshot);
+
+        let route = match_passthrough(&candidates, &snapshot.backends, &catalogs, "qwen3-coder")
+            .expect("match");
+        assert_eq!(
+            route.backend_ids,
+            vec![7],
+            "first candidate in stable order wins"
+        );
+        assert_eq!(route.model_name, "qwen3-coder");
+        assert_eq!(
+            route.provider_model_name, "qwen3-coder",
+            "provider model = requested model"
+        );
+        assert!(route.endpoints.is_empty());
+        assert_eq!(route.protocol, first.protocol);
+
+        // Unknown model misses everywhere.
+        assert!(match_passthrough(&candidates, &snapshot.backends, &catalogs, "nope").is_none());
+    }
+
+    #[test]
+    fn passthrough_match_requires_enabled_dynamic_backend_and_falls_through() {
+        let first = passthrough_route_for_test("a-free", 7);
+        let second = passthrough_route_for_test("b-free", 8);
+        let snapshot = passthrough_snapshot(
+            vec![first, second],
+            vec![
+                dynamic_backend_for_test(7, false), // backend disabled -> candidate can never match
+                dynamic_backend_for_test(8, true),
+            ],
+        );
+        let catalogs = DynamicCatalogStore::new_default();
+        catalogs.apply_fetch(7, Ok(vec!["m".to_string()]), 1_000);
+        catalogs.apply_fetch(8, Ok(vec!["m".to_string()]), 1_000);
+        let candidates = passthrough_candidates(&snapshot);
+
+        let route = match_passthrough(&candidates, &snapshot.backends, &catalogs, "m")
+            .expect("falls through to the second candidate");
+        assert_eq!(route.backend_ids, vec![8]);
+
+        // A non-dynamic backend has no catalog, so it can never satisfy a passthrough match.
+        let mut plain = dynamic_backend_for_test(8, true);
+        plain.dynamic_models = false;
+        let snapshot =
+            passthrough_snapshot(vec![passthrough_route_for_test("a-free", 8)], vec![plain]);
+        let candidates = passthrough_candidates(&snapshot);
+        assert!(match_passthrough(&candidates, &snapshot.backends, &catalogs, "m").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_route_prefers_the_exact_match_over_passthrough() {
+        let exact = {
+            let mut r = route_for_test("pinned-provider-model");
+            r.model_name = "shared-model".to_string();
+            r
+        };
+        let passthrough = passthrough_route_for_test("free-passthrough", 7);
+        let snapshot = passthrough_snapshot(
+            vec![exact.clone(), passthrough],
+            vec![dynamic_backend_for_test(7, true)],
+        );
+        let catalogs = DynamicCatalogStore::new_default();
+        catalogs.apply_fetch(7, Ok(vec!["shared-model".to_string()]), 1_000);
+        let state = passthrough_test_state(snapshot, Arc::new(catalogs));
+
+        let route = resolve_route(&state, &state.cfg.load_full(), "shared-model")
+            .await
+            .expect("route");
+        assert_eq!(route.provider_model_name, "pinned-provider-model");
+        assert!(
+            !route.passthrough,
+            "exact route wins even though the catalog also has it"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_refreshes_a_stale_catalog_on_miss_then_matches() {
+        let snapshot = passthrough_snapshot(
+            vec![passthrough_route_for_test("free-passthrough", 7)],
+            vec![dynamic_backend_for_test(7, true)],
+        );
+        // Fake fetcher: the "upstream" just rotated in a brand-new free model.
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let fetch: crate::catalog::ModelsFetch = Arc::new(move |_client, _backend| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["brand-new-free-model".to_string()]) })
+        });
+        let catalogs = Arc::new(DynamicCatalogStore::new(fetch));
+        let state = passthrough_test_state(snapshot, catalogs.clone());
+
+        // Miss everywhere: no route row, no catalog entry (=> stale) -> ONE bounded refresh,
+        // then the retry matches.
+        let route = resolve_route(&state, &state.cfg.load_full(), "brand-new-free-model")
+            .await
+            .expect("on-miss refresh turns the miss into a hit");
+        assert_eq!(route.provider_model_name, "brand-new-free-model");
+        assert_eq!(route.backend_ids, vec![7]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one refresh");
+
+        // Second request: the catalog is now fresh AND contains the model — no further fetch.
+        let again = resolve_route(&state, &state.cfg.load_full(), "brand-new-free-model")
+            .await
+            .expect("catalog hit without refresh");
+        assert_eq!(again.backend_ids, vec![7]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_route_without_passthrough_candidates_keeps_the_old_404_behaviour() {
+        let snapshot = passthrough_snapshot(
+            vec![route_for_test("pinned")],
+            vec![dynamic_backend_for_test(7, true)],
+        );
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let fetch: crate::catalog::ModelsFetch = Arc::new(move |_client, _backend| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["anything".to_string()]) })
+        });
+        let catalogs = Arc::new(DynamicCatalogStore::new(fetch));
+        let state = passthrough_test_state(snapshot, catalogs);
+
+        assert!(
+            resolve_route(&state, &state.cfg.load_full(), "unknown-model")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no passthrough route -> no refresh work at all"
+        );
+    }
+
+    fn passthrough_test_state(
+        snapshot: ConfigSnapshot,
+        catalogs: Arc<DynamicCatalogStore>,
+    ) -> Arc<AppState> {
+        use crate::budget::RamBudgetStore;
+        use crate::ledger::LedgerSink;
+        use crate::metrics::Metrics;
+        use crate::route::RamBackendPool;
+
+        fn metrics() -> Metrics {
+            static M: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();
+            M.get_or_init(Metrics::install).clone()
+        }
+
+        let (ptx, mut prx) = tokio::sync::mpsc::channel(8);
+        let (otx, mut orx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while prx.recv().await.is_some() {} });
+        tokio::spawn(async move { while orx.recv().await.is_some() {} });
+        let app_state = AppState {
+            cfg: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
+            budget: Arc::new(RamBudgetStore::new()),
+            backends: Arc::new(RamBackendPool::new_without_counter_pool()),
+            client: reqwest::Client::new(),
+            ledger: LedgerSink::new(ptx, otx),
+            metrics: metrics(),
+            max_body_bytes: 1024 * 1024,
+            quota: Arc::new(crate::quota::QuotaStore::new()),
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
+            config_ok_at: Arc::new(AtomicU64::new(1)),
+            config_err_at: Arc::new(AtomicU64::new(0)),
+            readiness_max_stale_ms: 5_000,
+            dynamic_catalogs: catalogs,
+        };
+        Arc::new(app_state)
     }
 
     #[test]
@@ -1388,29 +1856,10 @@ mod tests {
             quota_key: None,
             routing_policy: RoutingPolicy::LeastLoadedWeighted,
             endpoints: std::collections::HashMap::new(),
+            passthrough: false,
         };
         let body = Bytes::from_static(b"hello world");
         let est = estimate_tokens_len(body.len(), &route);
         assert!(est > 0);
-    }
-
-    #[test]
-    fn models_list_hides_disabled_routes() {
-        let mut enabled = route_for_test("enabled-backend-model");
-        enabled.model_name = "public-on".to_string();
-        let mut disabled = route_for_test("disabled-backend-model");
-        disabled.model_name = "public-off".to_string();
-        disabled.enabled = false;
-        let routes = std::collections::HashMap::from([
-            ("public-on".to_string(), enabled),
-            ("public-off".to_string(), disabled),
-        ]);
-
-        let payload = models_list_payload(&routes);
-        assert_eq!(payload["object"], "list");
-        let data = payload["data"].as_array().unwrap();
-        assert_eq!(data.len(), 1, "disabled route must be hidden");
-        assert_eq!(data[0]["id"], "public-on");
-        assert_eq!(data[0]["object"], "model");
     }
 }
