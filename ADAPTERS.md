@@ -95,6 +95,50 @@ A quota probe is part of the same row (`quota_probe`): path, query, any extra he
 response shape comes back. Leave it `None` and the account is passive-only — the Portal says so
 instead of showing a spinner.
 
+## Chat client -> Responses provider translation
+
+The one supported cross-family pair: a **chat-family route** (`/v1/chat/completions`, route protocol
+`openai_chat`) whose Model Group holds a **Responses-family endpoint** (endpoint protocol
+`openai_responses` or `codex_responses`, including xAI Grok and Codex OAuth). The mismatch itself is
+the trigger — there is no config switch and no per-model override. When it holds, the router rewrites
+the request into a Responses request before it leaves and rewrites the answer back into OpenAI Chat
+shape, so an OpenAI Chat client keeps working unchanged.
+
+How each side is mapped:
+
+- **Request** (`chat_request_to_responses`): the first system message becomes top-level
+  `instructions`; every other message becomes an `input` item with `input_text`/`output_text` parts;
+  chat tools flatten from the nested `function` form to Responses `{type, name, description,
+  parameters}`; `max_tokens` becomes `max_output_tokens`; the endpoint's provider model replaces the
+  public model name; `store:false` is always sent; `temperature`, `top_p`, and `stop` pass through.
+- **Response**: a JSON Responses answer becomes one `chat.completion` (`id`, `created`, client-facing
+  model name, choices, usage). A streamed answer becomes incremental `chat.completion.chunk` frames
+  ending in `[DONE]`, with usage carried on the final chunk.
+- **Codex endpoints** (`codex_responses`) always send `stream:true` upstream — the ChatGPT backend
+  only speaks SSE — so a non-streaming client call has the forced SSE folded back into one completion
+  before it is returned. Tool calls are folded too.
+- The upstream URL is always built on `/v1/responses`, so both SDK-style base URLs and Codex base
+  URLs (`.../backend-api/codex`) work unchanged.
+
+Limits, deliberate and validated:
+
+- **One direction only.** A Responses-family route with a chat endpoint, and every other cross, is
+  rejected by admin validation with a "not supported yet" message — the Portal route/group editor is
+  the same validation.
+- Chat fields with no Responses equivalent are **dropped, not approximated**: `n`, `logprobs`,
+  `frequency_penalty`, `presence_penalty`, `logit_bias`, `user`, `seed`, `parallel_tool_calls`,
+  `response_format`, and `stream_options`.
+- Multimodal chat parts (`image_url`, `input_audio`, ...) are dropped from text extraction; this
+  adapter is text-only.
+- Translated requests take the buffered path (never a streaming upload), and the fold-back lane caps
+  upstream bodies at 1 MiB.
+- Upstream error bodies pass through untranslated — an error is already provider-shaped diagnostics,
+  not a completion.
+
+The pure mapping lives in `src/translate_chat_responses.rs` (unit-tested in place); routing, retries,
+credentials, budget, and the ledger are untouched proxy concerns. `tests/translator_chat_responses.rs`
+drives the full path against in-test mock Responses upstreams.
+
 ## Quota smoke
 
 `tests/quota_smoke.rs` drives the real proxy against mock upstreams that reproduce each provider's

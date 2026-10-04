@@ -2385,6 +2385,17 @@ fn protocol_family(protocol: &str) -> &'static str {
     }
 }
 
+/// Cross-family endpoints a Model Group may hold. Same family always works; the single translated
+/// cross today is a chat-family route with a Responses-family endpoint (the proxy translates the
+/// request chat -> responses upstream and the answer back). Every other cross — including the
+/// reverse direction — is rejected until a translator exists for it.
+fn endpoint_family_allowed(route_protocol: &str, endpoint_protocol: &str) -> bool {
+    let route_family = protocol_family(route_protocol);
+    let endpoint_family = protocol_family(endpoint_protocol);
+    route_family == endpoint_family
+        || (route_family == "openai_chat" && endpoint_family == "openai_responses")
+}
+
 fn validate_key_ref(value: &str) -> Result<String, ApiError> {
     let r = value.trim();
     if r.starts_with("oauth:") {
@@ -2641,12 +2652,14 @@ fn validate_route(payload: UpsertRoute) -> Result<ValidatedRoute, ApiError> {
                     .unwrap_or_else(|| ProviderProtocol::parse(&protocol))
                     .as_str()
                     .to_string();
-                if protocol_family(&endpoint_protocol) != protocol_family(&protocol) {
+                if !endpoint_family_allowed(&protocol, &endpoint_protocol) {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         format!(
-                            "endpoint protocol {} is not compatible with group protocol {}",
-                            endpoint_protocol, protocol
+                            "endpoint protocol {endpoint_protocol} is not compatible with group \
+                             protocol {protocol}: only a chat route holding responses-family \
+                             endpoints (openai_responses, codex_responses) is translated today; \
+                             this cross-family combination is not supported yet"
                         ),
                     ));
                 }
@@ -4306,6 +4319,7 @@ mod tests {
         assert_eq!(protocol_family("local_openai_chat"), "openai_chat");
         assert_eq!(protocol_family("openai_completions"), "openai_completions");
         assert_eq!(protocol_family("openai_responses"), "openai_responses");
+        assert_eq!(protocol_family("codex_responses"), "openai_responses");
         assert_ne!(
             protocol_family("openai_chat"),
             protocol_family("openai_completions")
@@ -4318,6 +4332,54 @@ mod tests {
             protocol_family("openai_completions"),
             protocol_family("openai_responses")
         );
+    }
+
+    #[test]
+    fn model_group_allows_only_the_translated_chat_to_responses_cross() {
+        // Same family always allowed.
+        assert!(endpoint_family_allowed("openai_chat", "openai_chat"));
+        assert!(endpoint_family_allowed("openai_chat", "local_openai_chat"));
+        assert!(endpoint_family_allowed(
+            "openai_responses",
+            "codex_responses"
+        ));
+        assert!(endpoint_family_allowed(
+            "codex_responses",
+            "openai_responses"
+        ));
+        assert!(endpoint_family_allowed("systemone", "systemone"));
+        // The one translated cross: a chat-family route may hold Responses-family endpoints
+        // (openai_responses and the ChatGPT Codex variant).
+        assert!(endpoint_family_allowed("openai_chat", "openai_responses"));
+        assert!(endpoint_family_allowed("openai_chat", "codex_responses"));
+        assert!(endpoint_family_allowed(
+            "custom_openai_chat",
+            "codex_responses"
+        ));
+        // The reverse direction has no translator yet.
+        assert!(!endpoint_family_allowed("openai_responses", "openai_chat"));
+        assert!(!endpoint_family_allowed(
+            "codex_responses",
+            "local_openai_chat"
+        ));
+        // Every other cross stays rejected.
+        assert!(!endpoint_family_allowed(
+            "openai_chat",
+            "openai_completions"
+        ));
+        assert!(!endpoint_family_allowed(
+            "openai_chat",
+            "anthropic_messages"
+        ));
+        assert!(!endpoint_family_allowed("openai_chat", "openai_rerank"));
+        assert!(!endpoint_family_allowed(
+            "openai_responses",
+            "openai_completions"
+        ));
+        assert!(!endpoint_family_allowed(
+            "anthropic_messages",
+            "openai_chat"
+        ));
     }
 
     #[test]

@@ -258,13 +258,23 @@ pub fn error_body(status: u16, message: &str) -> Value {
     })
 }
 
+/// One accumulating `delta.tool_calls` entry: `id`/`name` arrive on the first chunk for an index,
+/// `arguments` arrives concatenated across chunks.
+#[derive(Default)]
+struct ToolCallFold {
+    id: Option<Value>,
+    name: Option<String>,
+    arguments: String,
+}
+
 /// Fold a `chat.completion.chunk` SSE stream into one non-streaming `chat.completion`.
 ///
 /// `id`/`created` come from the first chunk that carries them, `model` is the client-facing
 /// model name (the client never sees the upstream model string), `choices[0].message.content`
 /// is the concatenation of every `delta.content` (`delta.reasoning_content`, when present,
-/// becomes a sibling `reasoning_content` field), `finish_reason` is taken from the last chunk
-/// that has one and `usage` from the final chunk when the upstream sends one.
+/// becomes a sibling `reasoning_content` field), `delta.tool_calls` entries fold by index into
+/// `message.tool_calls`, `finish_reason` is taken from the last chunk that has one and `usage`
+/// from the final chunk when the upstream sends one.
 ///
 /// Returns `None` when no `data:` frame parsed — the caller turns that into a 502.
 pub fn aggregate_sse_to_completion(sse: &[u8], client_model: &str) -> Option<Value> {
@@ -273,6 +283,7 @@ pub fn aggregate_sse_to_completion(sse: &[u8], client_model: &str) -> Option<Val
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut saw_reasoning = false;
+    let mut tool_calls: Vec<ToolCallFold> = Vec::new();
     let mut finish_reason: Option<Value> = None;
     let mut usage: Option<Value> = None;
     let mut saw_chunk = false;
@@ -315,6 +326,31 @@ pub fn aggregate_sse_to_completion(sse: &[u8], client_model: &str) -> Option<Val
                     reasoning.push_str(part);
                     saw_reasoning = true;
                 }
+                for call in delta
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map_or(&[][..], Vec::as_slice)
+                {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    while tool_calls.len() <= index {
+                        tool_calls.push(ToolCallFold::default());
+                    }
+                    let folded = &mut tool_calls[index];
+                    if folded.id.is_none()
+                        && let Some(call_id) = call.get("id").filter(|v| !v.is_null())
+                    {
+                        folded.id = Some(call_id.clone());
+                    }
+                    if folded.name.is_none()
+                        && let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                    {
+                        folded.name = Some(name.to_string());
+                    }
+                    if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
+                    {
+                        folded.arguments.push_str(args);
+                    }
+                }
             }
             if let Some(reason) = choice.get("finish_reason")
                 && !reason.is_null()
@@ -335,9 +371,32 @@ pub fn aggregate_sse_to_completion(sse: &[u8], client_model: &str) -> Option<Val
 
     let mut message = serde_json::Map::new();
     message.insert("role".to_string(), Value::String("assistant".to_string()));
-    message.insert("content".to_string(), Value::String(content));
+    // Chat semantics: an assistant message that only calls tools carries null content.
+    if content.is_empty() && !tool_calls.is_empty() {
+        message.insert("content".to_string(), Value::Null);
+    } else {
+        message.insert("content".to_string(), Value::String(content));
+    }
     if saw_reasoning {
         message.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
+    if !tool_calls.is_empty() {
+        let calls: Vec<Value> = tool_calls
+            .into_iter()
+            .map(|folded| {
+                let mut function = serde_json::Map::new();
+                if let Some(name) = folded.name {
+                    function.insert("name".to_string(), Value::String(name));
+                }
+                function.insert("arguments".to_string(), Value::String(folded.arguments));
+                serde_json::json!({
+                    "id": folded.id.unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": Value::Object(function),
+                })
+            })
+            .collect();
+        message.insert("tool_calls".to_string(), Value::Array(calls));
     }
     let mut choice = serde_json::Map::new();
     choice.insert("index".to_string(), Value::from(0u64));
@@ -606,6 +665,33 @@ mod tests {
         );
         let out = aggregate_sse_to_completion(sse.as_bytes(), "m").unwrap();
         assert_eq!(out["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn sse_aggregation_folds_tool_call_deltas_into_message_tool_calls() {
+        // Streaming tool-call rounds split one call across many delta chunks; the folded
+        // completion must reconstruct id/name and concatenate the arguments string.
+        let sse = concat!(
+            "data: {\"id\":\"c3\",\"created\":99,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"c3\",\"created\":99,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"ci\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"c3\",\"created\":99,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ty\\\":\\\"Hanoi\\\"}\"}},{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"c3\",\"created\":99,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: [DONE]\n"
+        );
+        let out = aggregate_sse_to_completion(sse.as_bytes(), "public").unwrap();
+        let message = &out["choices"][0]["message"];
+        assert_eq!(message["content"], serde_json::Value::Null);
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{\"city\":\"Hanoi\"}",
+            "arguments concatenate across chunks"
+        );
+        assert_eq!(calls[1]["id"], "call_2");
+        assert_eq!(calls[1]["function"]["name"], "ping");
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]

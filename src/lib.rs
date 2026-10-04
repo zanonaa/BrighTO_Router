@@ -16,3 +16,4 @@ pub mod provider_registry;
 pub mod proxy;
 pub mod quota;
 pub mod route;
+pub mod translate_chat_responses;

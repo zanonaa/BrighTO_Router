@@ -859,6 +859,7 @@ async fn forward_backend_response(
     quota_key: Option<&crate::quota::QuotaKey>,
     quota_store: &crate::quota::QuotaStore,
     mut reporter: CompletionReporter,
+    translator: Option<crate::translate_chat_responses::ResponsesSseToChat>,
 ) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -877,6 +878,7 @@ async fn forward_backend_response(
         let (mut tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(1);
         let mut acc = UsageAccumulator::default();
         let mut stream = response.bytes_stream();
+        let mut translator = translator;
 
         tokio::spawn(async move {
             let mut client_aborted = false;
@@ -885,19 +887,46 @@ async fn forward_backend_response(
                 let next = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
                 match next {
                     Ok(Some(Ok(bytes))) => {
-                        if chunk_may_have_usage(&bytes) {
-                            extract_usage_from_sse_chunk(&bytes, format, &mut acc);
-                        }
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            client_aborted = true;
-                            break;
+                        // Translated frames carry chat-shaped usage on the final chunk, so the tap
+                        // reads what the client reads; the passthrough lane keeps reading the
+                        // upstream's own bytes.
+                        if let Some(translating) = translator.as_mut() {
+                            let out = translating.feed(&bytes);
+                            if !out.is_empty() {
+                                if chunk_may_have_usage(&out) {
+                                    extract_usage_from_sse_chunk(&out, format, &mut acc);
+                                }
+                                if tx.send(Ok(Bytes::from(out))).await.is_err() {
+                                    client_aborted = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            if chunk_may_have_usage(&bytes) {
+                                extract_usage_from_sse_chunk(&bytes, format, &mut acc);
+                            }
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                client_aborted = true;
+                                break;
+                            }
                         }
                     }
                     Ok(Some(Err(e))) => {
                         error_class = Some(e.to_string());
                         break;
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // Normal end: flush any trailing translated frame (e.g. an upstream that
+                        // ends its last event without a newline). A stream that never reached a
+                        // terminal Responses event stops silently — it must not look finished.
+                        if let Some(translating) = translator.as_mut() {
+                            let fin = translating.finish();
+                            if !fin.is_empty() {
+                                let _ = tx.send(Ok(Bytes::from(fin))).await;
+                            }
+                        }
+                        break;
+                    }
                     Err(_) => {
                         error_class = Some("idle timeout".to_string());
                         break;
@@ -1207,6 +1236,132 @@ async fn opencode_free_lane(
     }
 }
 
+/// Response body cap for the chat->Responses translation lane: completions and error bodies are
+/// small, and folding a stream larger than this would only hide a runaway upstream.
+const TRANSLATED_RESPONSE_BODY_LIMIT: u64 = 1024 * 1024;
+
+/// A Responses SSE body answering a non-streaming client starts with a `data:` (or `event:`)
+/// frame once leading whitespace is skipped. Cheaper and stricter than sniffing the whole body.
+fn looks_like_sse(body: &[u8]) -> bool {
+    let trimmed = body.trim_ascii_start();
+    trimmed.starts_with(b"data:") || trimmed.starts_with(b"event:")
+}
+
+/// Chat -> Responses translation lane for everything that is not a live stream translation:
+///
+/// * an upstream error is forwarded untouched (Responses error bodies already use the OpenAI error
+///   shape);
+/// * a JSON Responses body becomes one `chat.completion` (`responses_json_to_chat_completion`);
+/// * an SSE body (a pinned-stream Codex endpoint answering a non-streaming client, or an upstream
+///   that streams regardless) is translated into chat chunks and folded into one
+///   `chat.completion` — the client asked for JSON, so it must never see SSE frames.
+#[allow(clippy::too_many_arguments)]
+async fn translated_responses_lane(
+    state: &Arc<AppState>,
+    ctx: &ProxyContext,
+    response: reqwest::Response,
+    status: StatusCode,
+    backend_id: i64,
+    backend_name: &str,
+    pre_forward_ms: u64,
+    ttfb_ms: u64,
+    reservation: Option<BudgetReservation>,
+    concurrency: Option<ConcurrencyGuard>,
+    lease: BackendLease,
+) -> Response<Body> {
+    let upstream_status = status.as_u16();
+    let mut reporter = CompletionReporter::new(
+        state.clone(),
+        ctx,
+        backend_id,
+        backend_name.to_string(),
+        pre_forward_ms,
+        ttfb_ms,
+        reservation,
+        concurrency,
+        lease,
+    );
+    match read_bounded_response(response, TRANSLATED_RESPONSE_BODY_LIMIT).await {
+        Ok((body, upstream_headers)) => {
+            if !status.is_success() {
+                reporter.finish(upstream_status, 0, 0, true, false, None);
+                return build_response(status, upstream_headers, Body::from(body));
+            }
+            let completion = if looks_like_sse(&body) {
+                crate::translate_chat_responses::responses_sse_to_chat_chunks(
+                    &body,
+                    &ctx.model_name,
+                )
+                .and_then(|chat_sse| {
+                    crate::opencode_free::aggregate_sse_to_completion(
+                        chat_sse.as_bytes(),
+                        &ctx.model_name,
+                    )
+                })
+            } else {
+                crate::translate_chat_responses::responses_json_to_chat_completion(
+                    &body,
+                    &ctx.model_name,
+                )
+            };
+            match completion {
+                Some(completion) => {
+                    let bytes = completion.to_string();
+                    let acc = parse_usage_from_body(bytes.as_bytes(), BackendFormat::OpenAi);
+                    reporter.finish(
+                        upstream_status,
+                        acc.input_tokens,
+                        acc.output_tokens,
+                        !acc.seen_usage,
+                        false,
+                        None,
+                    );
+                    build_response(
+                        StatusCode::OK,
+                        json_content_type_headers(),
+                        Body::from(bytes),
+                    )
+                }
+                None => {
+                    reporter.finish(
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        0,
+                        0,
+                        true,
+                        false,
+                        Some("chat->responses translation failed".to_string()),
+                    );
+                    build_response(
+                        StatusCode::BAD_GATEWAY,
+                        reqwest::header::HeaderMap::new(),
+                        Body::from(
+                            "chat->responses translation: could not translate the upstream \
+                             responses body into a chat completion",
+                        ),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            reporter.finish(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                0,
+                0,
+                true,
+                false,
+                Some(e.clone()),
+            );
+            build_response(
+                StatusCode::BAD_GATEWAY,
+                reqwest::header::HeaderMap::new(),
+                Body::from(format!(
+                    "chat->responses translation response read failed: {e}"
+                )),
+            )
+        }
+    }
+}
+
 /// Điểm vào proxy: chọn backend (lease), retry trước byte đầu, forward response (stream thật).
 pub async fn proxy_forward(
     state: Arc<AppState>,
@@ -1274,6 +1429,14 @@ pub async fn proxy_forward(
         };
 
         let endpoint = ctx.route.endpoint_for(backend_id);
+        // Chat -> Responses translation is decided per attempt: the route protocol is what the
+        // client called, the endpoint protocol is what this upstream speaks. The mismatch itself is
+        // the trigger — there is no config switch.
+        let endpoint_protocol = ProviderProtocol::parse(&endpoint.protocol);
+        let translate_chat = crate::translate_chat_responses::chat_to_responses_applies(
+            ctx.protocol,
+            endpoint_protocol,
+        );
 
         let Some(body_for_attempt) = upload_body.take() else {
             request_total_for(&ctx, &backend.name, 502);
@@ -1292,18 +1455,30 @@ pub async fn proxy_forward(
         let request_body = match body_for_attempt {
             ProxyRequestBody::Buffered(body) => {
                 let original_body = body.clone();
-                let mut model_rewrite_chunks = if ctx.rewrite_model_in_proxy
-                    && endpoint.provider_model_name != ctx.model_name
-                {
-                    match rewrite_top_level_model_chunks(&body, &endpoint.provider_model_name) {
-                        Some(chunks) => Some(chunks),
+                // Translated requests are rebuilt from scratch: the endpoint provider model is
+                // written directly into the Responses body, so the top-level model rewrite below
+                // must not run again on it.
+                if translate_chat {
+                    let opts = crate::translate_chat_responses::request_opts(
+                        endpoint_protocol,
+                        &endpoint.provider_model_name,
+                    );
+                    match crate::translate_chat_responses::chat_request_to_responses(&body, &opts) {
+                        Some(translated) => {
+                            // Keep the original chat body for a retry on another endpoint: another
+                            // endpoint may be same-family and must forward the chat bytes.
+                            upload_body = Some(ProxyRequestBody::Buffered(original_body));
+                            reqwest::Body::from(Bytes::from(translated))
+                        }
                         None => {
                             request_total_for(&ctx, &backend.name, 400);
                             return tag_router_headers(
                                 build_response(
                                     StatusCode::BAD_REQUEST,
                                     reqwest::header::HeaderMap::new(),
-                                    Body::from("could not rewrite endpoint model field"),
+                                    Body::from(
+                                        "could not translate the chat request into the responses protocol",
+                                    ),
                                 ),
                                 &ctx.request_id,
                                 Some(&backend.name),
@@ -1312,34 +1487,72 @@ pub async fn proxy_forward(
                         }
                     }
                 } else {
-                    None
-                };
-                // The OpenCode free lane keeps the validated wire shape byte-for-byte: its
-                // upstream was probed without stream_options, so no include_usage splice there.
-                if !ctx.opencode_free
-                    && wants_include_usage_splice(
-                        backend.format,
-                        stream_request,
-                        ctx.stream_options_present,
-                        ctx.protocol,
-                    )
-                {
-                    let bytes = if let Some(chunks) = model_rewrite_chunks.take() {
-                        materialize_chunks(chunks).map(Bytes::from)
+                    let mut model_rewrite_chunks = if ctx.rewrite_model_in_proxy
+                        && endpoint.provider_model_name != ctx.model_name
+                    {
+                        match rewrite_top_level_model_chunks(&body, &endpoint.provider_model_name) {
+                            Some(chunks) => Some(chunks),
+                            None => {
+                                request_total_for(&ctx, &backend.name, 400);
+                                return tag_router_headers(
+                                    build_response(
+                                        StatusCode::BAD_REQUEST,
+                                        reqwest::header::HeaderMap::new(),
+                                        Body::from("could not rewrite endpoint model field"),
+                                    ),
+                                    &ctx.request_id,
+                                    Some(&backend.name),
+                                    start.elapsed().as_millis() as u64,
+                                );
+                            }
+                        }
                     } else {
-                        Some(body.clone())
-                    }
-                    .and_then(|b| splice_include_usage(&b).map(Bytes::from))
-                    .unwrap_or_else(|| body.clone());
-                    upload_body = Some(ProxyRequestBody::Buffered(body));
-                    reqwest::Body::from(bytes)
-                } else {
-                    upload_body = Some(ProxyRequestBody::Buffered(body));
-                    match model_rewrite_chunks {
-                        Some(chunks) => reqwest_body_from_chunks(chunks),
-                        None => reqwest::Body::from(original_body),
+                        None
+                    };
+                    // The OpenCode free lane keeps the validated wire shape byte-for-byte: its
+                    // upstream was probed without stream_options, so no include_usage splice there.
+                    // Translated Responses requests reject stream_options with unknown_parameter.
+                    if !ctx.opencode_free
+                        && wants_include_usage_splice(
+                            backend.format,
+                            stream_request,
+                            ctx.stream_options_present,
+                            ctx.protocol,
+                        )
+                    {
+                        let bytes = if let Some(chunks) = model_rewrite_chunks.take() {
+                            materialize_chunks(chunks).map(Bytes::from)
+                        } else {
+                            Some(body.clone())
+                        }
+                        .and_then(|b| splice_include_usage(&b).map(Bytes::from))
+                        .unwrap_or_else(|| body.clone());
+                        upload_body = Some(ProxyRequestBody::Buffered(body));
+                        reqwest::Body::from(bytes)
+                    } else {
+                        upload_body = Some(ProxyRequestBody::Buffered(body));
+                        match model_rewrite_chunks {
+                            Some(chunks) => reqwest_body_from_chunks(chunks),
+                            None => reqwest::Body::from(original_body),
+                        }
                     }
                 }
+            }
+            // A translated request is rebuilt from a buffered body; a streaming upload can never be
+            // translated. The handler already forces the buffered path for endpoint groups — this is
+            // the proxy-side backstop.
+            ProxyRequestBody::Streaming { .. } if translate_chat => {
+                request_total_for(&ctx, &backend.name, 400);
+                return tag_router_headers(
+                    build_response(
+                        StatusCode::BAD_REQUEST,
+                        reqwest::header::HeaderMap::new(),
+                        Body::from("streaming upload cannot be translated"),
+                    ),
+                    &ctx.request_id,
+                    Some(&backend.name),
+                    start.elapsed().as_millis() as u64,
+                );
             }
             ProxyRequestBody::Streaming { .. }
                 if !ctx.opencode_free
@@ -1365,7 +1578,16 @@ pub async fn proxy_forward(
             streaming @ ProxyRequestBody::Streaming { .. } => streaming.into_reqwest_body(),
         };
 
-        let url = build_target_url(&backend.base_url, &uri);
+        let url = if translate_chat {
+            // The translated body speaks the Responses API, so the upstream path must be the
+            // Responses one: `build_target_url` then keeps an SDK-style base URL prefix and appends
+            // `/responses` to a Codex-style base URL exactly like a native Responses route.
+            let target_uri =
+                Uri::from_static(crate::translate_chat_responses::RESPONSES_UPSTREAM_PATH);
+            build_target_url(&backend.base_url, &target_uri)
+        } else {
+            build_target_url(&backend.base_url, &uri)
+        };
         // Endpoint-level credential wins. auth_mode=none means no provider auth header, even if
         // the backend template has an env key. If no endpoint key exists, fallback to backend key.
         let auth_key = if endpoint.auth_mode == "none" {
@@ -1499,6 +1721,63 @@ pub async fn proxy_forward(
                         pre_forward_ms,
                     );
                 }
+                // Chat -> Responses translation lane: a streaming client gets the SSE transformed
+                // in the pump; anything else (non-stream client, or an upstream error) goes through
+                // the buffered translator. Error bodies pass through untouched in both arms.
+                if translate_chat {
+                    if stream_request && status < 400 {
+                        let reporter = CompletionReporter::new(
+                            state.clone(),
+                            &ctx,
+                            backend_id,
+                            backend.name.clone(),
+                            pre_forward_ms,
+                            ttfb_ms,
+                            reservation,
+                            concurrency,
+                            l,
+                        );
+                        let translator =
+                            Some(crate::translate_chat_responses::ResponsesSseToChat::new(
+                                &ctx.model_name,
+                            ));
+                        let resp = forward_backend_response(
+                            resp,
+                            backend.format,
+                            endpoint.quota_key.as_ref(),
+                            &state.quota,
+                            reporter,
+                            translator,
+                        )
+                        .await;
+                        return tag_router_headers(
+                            resp,
+                            &ctx.request_id,
+                            Some(&backend.name),
+                            pre_forward_ms,
+                        );
+                    }
+                    let adapted = translated_responses_lane(
+                        &state,
+                        &ctx,
+                        resp,
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        backend_id,
+                        &backend.name,
+                        pre_forward_ms,
+                        ttfb_ms,
+                        reservation,
+                        concurrency,
+                        l,
+                    )
+                    .await;
+                    return tag_router_headers(
+                        adapted,
+                        &ctx.request_id,
+                        Some(&backend.name),
+                        pre_forward_ms,
+                    );
+                }
                 let reporter = CompletionReporter::new(
                     state.clone(),
                     &ctx,
@@ -1516,6 +1795,7 @@ pub async fn proxy_forward(
                     endpoint.quota_key.as_ref(),
                     &state.quota,
                     reporter,
+                    None,
                 )
                 .await;
                 return tag_router_headers(
@@ -2131,6 +2411,36 @@ mod tests {
         assert!(is_stream_request(br#"{"stream":true}"#));
         assert!(is_stream_request(br#"{"stream": true}"#));
         assert!(!is_stream_request(br#"{"stream":false}"#));
+    }
+
+    #[test]
+    fn sse_body_detection_for_translated_lane() {
+        // Leading whitespace and BOM-free `data:` frames mark SSE.
+        assert!(looks_like_sse(b"data: {\"type\":\"response.created\"}\n\n"));
+        assert!(looks_like_sse(b"\r\ndata: [DONE]\n\n"));
+        // `event:`-first bodies are still SSE streams in practice.
+        assert!(looks_like_sse(b"event: response.created\ndata: {}\n\n"));
+        // A JSON completion or error body must not be mistaken for a stream.
+        assert!(!looks_like_sse(br#"{"id":"resp_abc","object":"response"}"#));
+        assert!(!looks_like_sse(b""));
+        assert!(!looks_like_sse(b"   "));
+    }
+
+    #[test]
+    fn translated_request_targets_responses_path() {
+        // The translated upstream URL is built on the Responses path regardless of the incoming
+        // chat path: SDK-style bases keep their /v1, Codex bases append to their prefix.
+        let uri: Uri = crate::translate_chat_responses::RESPONSES_UPSTREAM_PATH
+            .parse()
+            .unwrap();
+        assert_eq!(
+            build_target_url("https://api.openai.com/v1", &uri),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            build_target_url("https://chatgpt.com/backend-api/codex", &uri),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
     }
 
     #[test]
